@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Beat Night — Community Hub</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bangers&family=Archivo:wght@400;700;900&display=swap" rel="stylesheet">
+
+<!-- ── PASTE YOUR FIREBASE CONFIG HERE ───────────────────────────────────
+     Get it from: Firebase Console → Project Settings → Your Apps → Web
+     This config is safe to be public — security is handled by Firestore Rules -->
+<script type="module">
+  import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+  import { getFirestore, collection, doc, getDocs, getDoc, orderBy, query, limit } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+
+  const firebaseConfig = {
+    apiKey:            "PASTE_YOUR_apiKey_HERE",
+    authDomain:        "PASTE_YOUR_authDomain_HERE",
+    projectId:         "PASTE_YOUR_projectId_HERE",
+    storageBucket:     "PASTE_YOUR_storageBucket_HERE",
+    messagingSenderId: "PASTE_YOUR_messagingSenderId_HERE",
+    appId:             "PASTE_YOUR_appId_HERE"
+  };
+  // ─────────────────────────────────────────────────────────────────────
+
+  const app = initializeApp(firebaseConfig);
+  const db  = getFirestore(app);
+
+  const TIERS = [
+    { min:0,    label:'Seedling',     icon:'🌱', color:'#8b8b96' },
+    { min:100,  label:'Listener',     icon:'🎧', color:'#4caf50' },
+    { min:300,  label:'Producer',     icon:'🎵', color:'#2196f3' },
+    { min:700,  label:'High Voltage', icon:'⚡', color:'#9c27b0' },
+    { min:1500, label:'Diamond Drop', icon:'💎', color:'#34f5e4' },
+    { min:3000, label:'Hall Legend',  icon:'🏆', color:'#ffc94d' },
+    { min:6000, label:'LEGENDARY',    icon:'👑', color:'#ff2d4d' },
+  ];
+  function getTier(xp){ for(let i=TIERS.length-1;i>=0;i--) if(xp>=TIERS[i].min) return TIERS[i]; return TIERS[0]; }
+  function xpToNext(xp){ for(let t of TIERS) if(xp<t.min) return t.min; return null; }
+
+  // Single source of truth: the same beatNightConsole/players map the host console
+  // reads, so the public page and the console always show the identical roster.
+  // (beatNight/players/all is the bot's live-XP collection and only knows about
+  // people who have submitted since the bot came online — it misses the archive.)
+  // Cache the promise, not the result — Rankings and Hall of Fame both call this
+  // in the same tick, and caching the result would fire two identical reads.
+  let _playersPromise = null;
+  function loadPlayerMap(){
+    if(_playersPromise) return _playersPromise;
+    _playersPromise = (async()=>{
+      try{
+        const snap = await getDoc(doc(db,'beatNightConsole','players'));
+        const val = snap.exists() ? snap.data().value : null;
+        if(!val || typeof val!=='object') return [];
+        return Object.values(val).filter(p=>p&&p.name).map(p=>({
+          name: p.name, xp: p.xp||0, wins: p.wins||0, submissions: p.submissions||0
+        }));
+      }catch(e){ return []; }
+    })();
+    return _playersPromise;
+  }
+
+  async function loadLeaderboard(){
+    const el = document.getElementById('leaderboardRows');
+    try{
+      const players = [...await loadPlayerMap()].sort((a,b)=>b.xp-a.xp);
+      if(!players.length){ el.innerHTML='<p class="pub-empty">No players yet.</p>'; return; }
+      const medals=['🥇','🥈','🥉'];
+      el.innerHTML = players.map((p,i)=>{
+        const t = getTier(p.xp||0);
+        const next = xpToNext(p.xp||0);
+        const pct = next ? Math.min(100,((p.xp-t.min)/(next-t.min))*100) : 100;
+        return `<div class="pub-row${i<3?' rank-'+( i+1):''}">
+          <div class="pub-rank">${medals[i]||('#'+(i+1))}</div>
+          <div class="pub-badge">${t.icon}</div>
+          <div class="pub-info">
+            <div class="pub-name">${p.name||'—'}</div>
+            <div class="pub-tier" style="color:${t.color}">${t.label}</div>
+            <div class="pub-bar-wrap"><div class="pub-bar" style="width:${pct}%;background:${t.color}"></div></div>
+          </div>
+          <div class="pub-stats">
+            <div class="pub-xp" style="color:${t.color}">${p.xp||0} XP</div>
+            <div class="pub-meta">${p.wins||0}W / ${p.submissions||0}S</div>
+          </div>
+        </div>`;
+      }).join('');
+    }catch(e){ el.innerHTML='<p class="pub-empty">Could not load — Firebase may not be configured yet.</p>'; }
+  }
+
+  async function loadHOF(){
+    const el = document.getElementById('hofRows');
+    try{
+      const players = (await loadPlayerMap()).filter(p=>p.wins>0).sort((a,b)=>b.wins-a.wins).slice(0,5);
+      if(!players.length){ el.innerHTML='<p class="pub-empty">No data yet.</p>'; return; }
+      el.innerHTML = players.map((p,i)=>{
+        const t=getTier(p.xp||0);
+        return `<div class="pub-hof-row"><span>${t.icon} ${p.name||'—'}</span><span>${p.wins||0} wins</span></div>`;
+      }).join('');
+    }catch(e){ el.innerHTML='<p class="pub-empty">Could not load.</p>'; }
+  }
+
+  async function loadHonBangers(){
+    const el = document.getElementById('bangersRows');
+    try{
+      const docSnap = await getDoc(doc(db,'beatNight','honBangers'));
+      let bangers = docSnap.exists() ? docSnap.data().list || [] : [];
+      // Also try the console localStorage-style key
+      if(!bangers.length){
+        el.innerHTML='<p class="pub-empty">No Hot or Not sessions yet.</p>'; return;
+      }
+      bangers.sort((a,b)=>b.score-a.score);
+      const medals=['🥇','🥈','🥉'];
+      el.innerHTML = bangers.slice(0,10).map((r,i)=>`
+        <div class="pub-hof-row">
+          <span>${medals[i]||(i+1+'.')} ${r.author}</span>
+          <span>${r.fire}🔥 ${r.skull}💀 <strong>+${r.score}</strong></span>
+        </div>`).join('');
+    }catch(e){ el.innerHTML='<p class="pub-empty">No Hall of Bangers data yet.</p>'; }
+  }
+
+  async function loadHistory(){
+    try{
+      const snap = await getDoc(doc(db,'beatNightConsole','history'));
+      if(!snap.exists()) return [];
+      const val = snap.data().value;
+      return Array.isArray(val) ? val : [];
+    }catch(e){ return []; }
+  }
+
+  async function loadFightCard(history){
+    const el = document.getElementById('fightCardRows');
+    if(!history.length){ el.innerHTML='<p class="pub-empty">No rounds saved yet.</p>'; return; }
+    const medals=['🥇','🥈','🥉'];
+    // compute round numbers per date
+    const dateCount={};
+    const withNums = history.map(r=>{
+      dateCount[r.date]=(dateCount[r.date]||0)+1;
+      return{...r,roundNum:dateCount[r.date]};
+    });
+    el.innerHTML = [...withNums].reverse().map(r=>{
+      const top3=[...r.entries].sort((a,b)=>a.rank-b.rank).slice(0,3);
+      const cards=top3.map((e,i)=>`<div class="pub-contestant rank-${i+1}">
+        <span class="pub-medal">${medals[i]||''}</span>
+        <div class="pub-c-name">${e.name}</div>
+        <div class="pub-c-votes">${e.votes} votes</div>
+      </div>`).join('');
+      return `<div class="pub-bout">
+        <div class="pub-bout-header"><span class="pub-round-ribbon">ROUND ${r.roundNum}</span><span class="pub-bout-date">${r.date}</span></div>
+        <div class="pub-contestants">${cards}</div>
+      </div>`;
+    }).join('');
+  }
+
+  function computeHOFFromHistory(history){
+    const entered={}, wins={}, streak={}, current={};
+    history.forEach(r=>{
+      r.entries.forEach(e=>{
+        entered[e.name]=(entered[e.name]||0)+1;
+        if(e.rank===1){
+          wins[e.name]=(wins[e.name]||0)+1;
+          current[e.name]=(current[e.name]||0)+1;
+          if((current[e.name]||0)>=(streak[e.name]||0)) streak[e.name]=current[e.name];
+        } else {
+          current[e.name]=0;
+        }
+      });
+    });
+    const recent=[...history].reverse().slice(0,5).map(r=>{
+      const w=r.entries.find(e=>e.rank===1);
+      return{name:w?w.name:'—',date:r.date};
+    });
+    return{entered,wins,streak,recent};
+  }
+
+  async function loadHOFDetails(history){
+    const{entered,wins,streak,recent}=computeHOFFromHistory(history);
+    const lineRow=(name,val)=>`<div class="pub-hof-row"><span>${name}</span><span>${val}</span></div>`;
+    const topN=(obj,n,fmt)=>Object.entries(obj).sort((a,b)=>b[1]-a[1]).slice(0,n).map(([n,v])=>lineRow(n,fmt(v))).join('');
+    document.getElementById('hofStreakRows').innerHTML  = topN(streak,5,v=>v+' in a row') || '<p class="pub-empty">No data.</p>';
+    document.getElementById('hofEnteredRows').innerHTML= topN(entered,5,v=>v+' rounds')  || '<p class="pub-empty">No data.</p>';
+    document.getElementById('hofRecentRows').innerHTML = recent.map(r=>lineRow(r.name,r.date)).join('') || '<p class="pub-empty">No data.</p>';
+  }
+
+  window.addEventListener('DOMContentLoaded', async ()=>{
+    // Map + pins are pure local data (no Firebase) — draw them first so a slow or
+    // unconfigured Firestore can never leave the map blank.
+    try{ pubInitMap(); pubLoadPins(); }catch(e){ console.error('map init failed', e); }
+
+    loadLeaderboard();
+    loadHOF();
+    loadHonBangers();
+
+    // getDoc() hangs indefinitely (rather than rejecting) when Firestore can't be
+    // reached, so cap the wait and fall back to an empty history.
+    const hist = await Promise.race([
+      loadHistory(),
+      new Promise(res=>setTimeout(()=>res([]), 8000))
+    ]);
+    loadFightCard(hist);
+    loadHOFDetails(hist);
+  });
+</script>
+
+<style>
+  :root{
+    --ink:#FBE9C6; --panel:#fff; --panel-2:#FFF6E0;
+    --paper:#0a0a0a; --muted:#4a4a4a;
+    --ink-line:#0a0a0a; --halftone:rgba(0,0,0,.10);
+    --red:#ED1C24; --yellow:#FFD400; --cyan:#0072CE;
+    --magenta:#E91E8C; --gold:#FFD400;
+    --display:'Bangers',cursive; --mono:'Archivo','Helvetica Neue',Arial,sans-serif;
+  }
+  html[data-theme="dark"]{
+    --ink:#1a1622; --panel:#262030; --panel-2:#2d2738;
+    --paper:#f4f0e6; --muted:#a89fb5;
+    --ink-line:#f4f0e6; --halftone:rgba(255,255,255,.07);
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  body{
+    background:var(--ink) !important;
+    background-image:radial-gradient(circle, var(--halftone) 1.4px, transparent 1.6px) !important;
+    background-size:12px 12px !important;
+    font-family:var(--mono); color:var(--paper);
+    padding-bottom:60px;
+  }
+
+  /* ── HEADER ── */
+  .pub-hero{
+    background:var(--red); border-bottom:5px solid var(--ink-line);
+    padding:34px 28px 28px; text-align:center; position:relative;
+    box-shadow:0 8px 0 var(--ink-line);
+  }
+  .pub-hero-burst{
+    display:inline-block; position:relative;
+    background:var(--yellow); padding:14px 34px;
+    clip-path:polygon(4% 0%,96% 0%,100% 50%,96% 100%,4% 100%,0% 50%);
+    margin-bottom:12px;
+    box-shadow:4px 4px 0 var(--ink-line);
+  }
+  .pub-hero-burst span{ font-family:var(--display); font-size:2.4rem; color:#0a0a0a; -webkit-text-stroke:1px #0a0a0a; letter-spacing:.04em; }
+  .pub-hero h1{ font-family:var(--display); font-size:1.4rem; color:#fff; letter-spacing:.1em; -webkit-text-stroke:1px rgba(0,0,0,.3); }
+  .pub-hero p{ font-size:.78rem; color:rgba(255,255,255,.8); margin-top:6px; letter-spacing:.04em; }
+  .pub-theme-btn{ position:absolute; top:14px; right:14px; background:var(--ink-line); color:var(--ink); border:none; border-radius:20px; padding:6px 14px; font-size:.7rem; font-weight:700; cursor:pointer; letter-spacing:.06em; }
+
+  /* ── NAV ── */
+  .pub-nav{ display:flex; gap:0; justify-content:center; border-bottom:4px solid var(--ink-line); overflow-x:auto; background:var(--panel); }
+  .pub-nav-btn{
+    padding:12px 22px; font-family:var(--display); font-size:1rem; letter-spacing:.04em;
+    background:transparent; border:none; border-right:2px solid var(--ink-line); cursor:pointer;
+    color:var(--paper); transition:background .15s; white-space:nowrap;
+  }
+  .pub-nav-btn:last-child{ border-right:none; }
+  .pub-nav-btn:hover, .pub-nav-btn.active{ background:var(--red); color:#fff; }
+
+  /* ── SECTIONS ── */
+  .pub-section{ display:none; max-width:900px; margin:0 auto; padding:28px 18px; }
+  .pub-section.active{ display:block; }
+  .pub-section-title{
+    font-family:var(--display); font-size:2rem; color:var(--red);
+    -webkit-text-stroke:1.2px var(--ink-line); margin-bottom:18px;
+    letter-spacing:.04em; text-transform:uppercase;
+  }
+  .pub-card{
+    background:var(--panel); border:3px solid var(--ink-line);
+    box-shadow:6px 6px 0 var(--ink-line); border-radius:8px; padding:18px;
+    margin-bottom:20px;
+  }
+  .pub-card h3{ font-family:var(--display); font-size:1.25rem; color:var(--red); margin-bottom:12px; letter-spacing:.03em; }
+  .pub-empty{ color:var(--muted); font-size:.82rem; font-style:italic; }
+
+  /* ── LEADERBOARD ── */
+  .pub-row{
+    display:flex; align-items:center; gap:12px; padding:10px 0;
+    border-bottom:1px solid var(--panel-2);
+  }
+  .pub-row.rank-1{ border-left:4px solid var(--gold); padding-left:10px; }
+  .pub-row.rank-2{ border-left:4px solid #c0c0c0; padding-left:10px; }
+  .pub-row.rank-3{ border-left:4px solid #cd7f32; padding-left:10px; }
+  .pub-rank{ width:32px; font-size:.78rem; color:var(--muted); }
+  .pub-badge{ font-size:1.4rem; width:28px; }
+  .pub-info{ flex:1; min-width:0; }
+  .pub-name{ font-family:var(--display); font-size:1.1rem; color:var(--paper); }
+  .pub-tier{ font-size:.68rem; text-transform:uppercase; letter-spacing:.05em; margin-top:2px; }
+  .pub-bar-wrap{ height:5px; background:var(--panel-2); border-radius:3px; margin-top:4px; overflow:hidden; border:1px solid var(--ink-line); }
+  .pub-bar{ height:100%; border-radius:3px; }
+  .pub-stats{ text-align:right; }
+  .pub-xp{ font-weight:700; font-size:.88rem; }
+  .pub-meta{ font-size:.66rem; color:var(--muted); margin-top:2px; }
+
+  /* ── HOF ── */
+  .pub-hof-row{ display:flex; justify-content:space-between; font-size:.84rem; padding:7px 0; border-bottom:1px solid var(--panel-2); }
+
+  /* ── TOOLS ── */
+  .tools-grid{ display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  @media(max-width:600px){ .tools-grid{ grid-template-columns:1fr; } }
+  .tool-title{ font-family:var(--display); font-size:1.1rem; color:var(--red); margin-bottom:10px; }
+  .pub-input{
+    width:100%; background:var(--panel-2); border:2px solid var(--ink-line);
+    color:var(--paper); padding:.55rem .7rem; border-radius:5px; font-family:var(--mono); font-size:.88rem;
+  }
+  .pub-btn{
+    background:var(--red); color:#fff; border:2px solid var(--ink-line);
+    padding:.6rem 1.2rem; border-radius:6px; box-shadow:3px 3px 0 var(--ink-line);
+    font-family:var(--display); font-size:.95rem; cursor:pointer; letter-spacing:.04em;
+    margin-top:8px; width:100%;
+  }
+  .pub-btn:hover{ background:#ff4d54; }
+  .pub-btn.sec{ background:var(--panel); color:var(--paper); }
+  .pub-result{
+    font-family:var(--display); font-size:2.4rem; text-align:center;
+    color:var(--cyan); -webkit-text-stroke:1.5px var(--ink-line);
+    padding:14px 0 4px; min-height:60px;
+  }
+  .pub-result-sub{ text-align:center; font-size:.72rem; color:var(--muted); letter-spacing:.06em; margin-bottom:8px; }
+
+  /* tap tempo */
+  .tap-btn{
+    width:100%; height:90px; background:var(--panel); border:3px solid var(--ink-line);
+    box-shadow:5px 5px 0 var(--ink-line); border-radius:8px; cursor:pointer;
+    font-family:var(--display); font-size:1.5rem; color:var(--paper); letter-spacing:.06em;
+    transition:transform .1s, box-shadow .1s;
+  }
+  .tap-btn:active{ transform:translate(3px,3px); box-shadow:2px 2px 0 var(--ink-line); }
+
+  /* beat timer */
+  .timer-presets{ display:flex; gap:6px; margin-bottom:4px; }
+  .timer-preset{
+    flex:1; background:var(--panel-2); border:2px solid var(--ink-line); color:var(--paper);
+    padding:.4rem 0; border-radius:5px; cursor:pointer; font-family:var(--mono); font-size:.78rem;
+  }
+  .timer-preset:hover{ background:var(--panel); }
+  .timer-preset.active{ background:var(--red); color:#fff; }
+  .pub-result.timer-done{ color:var(--red); animation:timerFlash 1s steps(2) infinite; }
+  @keyframes timerFlash{ 50%{ opacity:.25; } }
+
+  /* key chart */
+  .key-grid{ display:grid; grid-template-columns:repeat(6,1fr); gap:4px; }
+  .key-cell{ background:var(--panel-2); border:1px solid var(--ink-line); padding:5px 3px; text-align:center; font-size:.65rem; border-radius:3px; }
+  .key-cell.root{ background:var(--red); color:#fff; font-weight:700; border-color:var(--ink-line); }
+  .key-select{ width:100%; background:var(--panel-2); border:2px solid var(--ink-line); color:var(--paper); padding:.45rem .6rem; border-radius:5px; font-family:var(--mono); font-size:.85rem; margin-bottom:8px; }
+
+  /* beat name gen */
+  .beat-name-display{
+    font-family:var(--display); font-size:1.5rem; color:var(--yellow);
+    -webkit-text-stroke:1px var(--ink-line); text-align:center;
+    padding:16px; background:var(--panel-2); border:2px solid var(--ink-line);
+    border-radius:6px; min-height:60px; margin-bottom:8px; line-height:1.2;
+  }
+
+  /* ── STREAMLOOTS SUPPORT CARDS ── */
+  .support-section{ grid-column:1/-1; margin-top:10px; }
+  .support-tagline{
+    text-align:center; margin-bottom:26px;
+    background:linear-gradient(135deg,#0a0a10,#1a1230);
+    border:3px solid var(--ink-line); box-shadow:6px 6px 0 var(--ink-line);
+    border-radius:8px; padding:28px;
+  }
+  .sup-kicker{ font-family:var(--display); font-size:.82rem; letter-spacing:.2em; color:var(--red); text-transform:uppercase; margin-bottom:8px; }
+  .support-tagline h2{ font-family:var(--display); font-size:1.9rem; color:var(--yellow); -webkit-text-stroke:1.4px #000; line-height:1.15; margin-bottom:10px; }
+  .support-tagline p{ font-size:.82rem; color:#b8b0cc; line-height:1.65; max-width:540px; margin:0 auto 20px; }
+  .sup-cta-btn{
+    display:inline-block; background:var(--red); color:#fff;
+    font-family:var(--display); font-size:1.1rem; letter-spacing:.08em;
+    padding:.8rem 2.2rem; border:3px solid #000;
+    box-shadow:5px 5px 0 #000; border-radius:6px;
+    text-decoration:none; transition:transform .1s,box-shadow .1s;
+  }
+  .sup-cta-btn:hover{ transform:translate(3px,3px); box-shadow:2px 2px 0 #000; background:#ff4040; }
+  .cards-row{ display:flex; gap:20px; justify-content:center; flex-wrap:wrap; perspective:900px; }
+  .sl-card{ width:155px; flex:none; cursor:pointer; position:relative; transform-style:preserve-3d; transition:transform .35s ease, filter .35s ease; }
+  .sl-card:hover{ transform:translateY(-14px) rotateX(6deg) scale(1.07); filter:brightness(1.12); }
+  .sl-card-inner{
+    width:155px; height:218px; border-radius:14px; overflow:hidden;
+    border:2.5px solid rgba(255,255,255,.18);
+    box-shadow:0 12px 32px rgba(0,0,0,.6), 0 0 0 1px rgba(255,255,255,.07);
+    display:flex; flex-direction:column; position:relative;
+  }
+  .sl-card-glow{ position:absolute; inset:-3px; border-radius:16px; opacity:0; transition:opacity .35s; pointer-events:none; z-index:2; }
+  .sl-card:hover .sl-card-glow{ opacity:1; }
+  .sl-card-art{ flex:1; display:flex; align-items:center; justify-content:center; font-size:3rem; position:relative; overflow:hidden; }
+  .sl-card-art::before{ content:''; position:absolute; inset:0; background:radial-gradient(ellipse at 40% 30%, rgba(255,255,255,.18), transparent 65%); }
+  .sl-card-corner{ position:absolute; top:7px; left:9px; font-size:.58rem; font-weight:700; letter-spacing:.08em; color:rgba(255,255,255,.75); font-family:var(--mono); }
+  .sl-card-bottom{ padding:9px 10px 11px; background:rgba(0,0,0,.6); backdrop-filter:blur(6px); }
+  .sl-card-name{ font-family:var(--display); font-size:.9rem; color:#fff; letter-spacing:.04em; margin-bottom:3px; }
+  .sl-card-desc{ font-size:.55rem; color:rgba(255,255,255,.7); line-height:1.45; letter-spacing:.02em; }
+  .sl-card-rarity{ position:absolute; top:7px; right:9px; font-size:.55rem; font-weight:700; letter-spacing:.1em; opacity:.85; }
+
+  .card-chaos .sl-card-inner{ background:linear-gradient(160deg,#200836,#6b1a9a,#cc005a); }
+  .card-chaos .sl-card-glow{ box-shadow:0 0 22px 6px rgba(220,0,140,.55); }
+  .card-chaos .sl-card-rarity{ color:#ff99e0; }
+  .card-tempo .sl-card-inner{ background:linear-gradient(160deg,#081826,#0b4d8a,#00b8e6); }
+  .card-tempo .sl-card-glow{ box-shadow:0 0 22px 6px rgba(0,180,255,.5); }
+  .card-tempo .sl-card-rarity{ color:#7ee6ff; }
+  .card-wild .sl-card-inner{ background:linear-gradient(160deg,#1a1000,#7a4a00,#e8b400); }
+  .card-wild .sl-card-glow{ box-shadow:0 0 22px 6px rgba(240,170,0,.55); }
+  .card-wild .sl-card-rarity{ color:#FFD400; }
+  .card-veto .sl-card-inner{ background:linear-gradient(160deg,#041208,#1a4a1a,#00d45a); }
+  .card-veto .sl-card-glow{ box-shadow:0 0 22px 6px rgba(0,200,80,.5); }
+  .card-veto .sl-card-rarity{ color:#7effb2; }
+
+  /* ── FOOTER ── */
+  .pub-footer{ text-align:center; font-size:.7rem; color:var(--muted); padding:32px 18px 0; letter-spacing:.06em; }
+
+  /* ── FIGHT CARD (public) ── */
+  .pub-bout{background:linear-gradient(135deg,var(--panel),rgba(237,28,36,.06));border:3px solid var(--ink-line);box-shadow:5px 5px 0 var(--ink-line);border-radius:8px;padding:14px;margin-bottom:16px;}
+  .pub-bout-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;}
+  .pub-round-ribbon{background:var(--yellow);color:#0a0a0a;font-family:var(--display);font-size:.9rem;letter-spacing:.06em;padding:4px 12px;border:2px solid var(--ink-line);border-radius:3px;box-shadow:2px 2px 0 var(--ink-line);}
+  .pub-bout-date{font-size:.66rem;color:var(--muted);letter-spacing:.04em;}
+  .pub-contestants{display:flex;gap:10px;flex-wrap:wrap;}
+  .pub-contestant{flex:1;min-width:110px;background:var(--panel-2);border:2px solid var(--ink-line);border-radius:8px;padding:12px 8px;text-align:center;}
+  .pub-contestant.rank-1{border-color:var(--gold);box-shadow:0 0 0 1px var(--gold);}
+  .pub-contestant.rank-2{border-color:#c0c0c0;}
+  .pub-contestant.rank-3{border-color:#cd7f32;}
+  .pub-medal{font-size:1.8rem;display:block;line-height:1;}
+  .pub-c-name{font-family:var(--display);font-size:1.05rem;color:var(--paper);}
+  .pub-c-votes{font-size:.7rem;background:var(--ink-line);color:var(--ink);padding:2px 8px;border-radius:10px;display:inline-block;margin-top:4px;font-weight:700;}
+  /* ── WORLD MAP (public) ── */
+  .pub-map-wrap{background:var(--panel);border:3px solid var(--ink-line);box-shadow:6px 6px 0 var(--ink-line);border-radius:8px;padding:12px;margin-bottom:20px;}
+  .pub-map-wrap svg{width:100%;height:auto;display:block;}
+  .pub-map-country{fill:var(--panel-2);stroke:var(--muted);stroke-width:0.6;}
+  .pub-map-pin{fill:var(--red);stroke:#fff;stroke-width:1.5;cursor:pointer;transition:fill .15s;}
+  .pub-map-pin:hover{fill:var(--yellow);}
+  .pub-map-add{background:var(--panel);border:3px solid var(--ink-line);box-shadow:5px 5px 0 var(--ink-line);border-radius:8px;padding:16px;margin-bottom:16px;display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;}
+  .pub-map-add label{display:flex;flex-direction:column;gap:4px;font-size:.64rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;flex:1;min-width:140px;}
+  .pub-map-pin-list{background:var(--panel);border:3px solid var(--ink-line);box-shadow:5px 5px 0 var(--ink-line);border-radius:8px;padding:16px;}
+  .pub-map-pin-list h3{font-family:var(--display);font-size:1.1rem;color:var(--red);margin-bottom:10px;}
+  .pub-pin-group{margin-bottom:10px;}
+  .pub-pin-loc{font-family:var(--display);color:var(--red);font-size:.88rem;margin-bottom:4px;}
+  .pub-pin-names{display:flex;flex-wrap:wrap;gap:5px;}
+  .pub-pin-chip{background:var(--panel-2);border:2px solid var(--ink-line);border-radius:14px;padding:2px 10px;font-size:.74rem;display:flex;align-items:center;gap:5px;}
+  .pub-pin-chip button{background:none;border:none;color:var(--red);cursor:pointer;font-size:.78rem;}
+</style>
+</head>
+<body>
+
+<div class="pub-hero">
+  <button class="pub-theme-btn" id="themeToggle" onclick="(()=>{ const h=document.documentElement; h.dataset.theme=h.dataset.theme==='dark'?'light':'dark'; this.textContent=h.dataset.theme==='dark'?'☀️ Light':'🌙 Dark'; })()">☀️ Light</button>
+  <div class="pub-hero-burst"><span>BEAT NIGHT</span></div>
+  <h1>Community Hub</h1>
+  <p>Rankings · Hall of Fame · Producer Tools</p>
+</div>
+
+<nav class="pub-nav">
+  <button class="pub-nav-btn active" onclick="showSection('rankings',this)">⚡ Rankings</button>
+  <button class="pub-nav-btn" onclick="showSection('hof',this)">🏆 Hall of Fame</button>
+  <button class="pub-nav-btn" onclick="showSection('fightcard',this)">🥊 Fight Card</button>
+  <button class="pub-nav-btn" onclick="showSection('worldmap',this)">🗺️ World Map</button>
+  <button class="pub-nav-btn" onclick="showSection('tools',this)">🎛️ Producer Tools</button>
+</nav>
+
+<!-- ─── RANKINGS ─── -->
+<section class="pub-section active" id="sec-rankings">
+  <div class="pub-section-title">⚡ Prestige Rankings</div>
+  <div class="pub-card">
+    <h3>Top Producers</h3>
+    <div id="leaderboardRows"><p class="pub-empty">Loading...</p></div>
+  </div>
+</section>
+
+<!-- ─── HALL OF FAME ─── -->
+<section class="pub-section" id="sec-hof">
+  <div class="pub-section-title">🏆 Hall of Fame</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+    <div class="pub-card"><h3>👑 Most Wins</h3><div id="hofRows"><p class="pub-empty">Loading...</p></div></div>
+    <div class="pub-card"><h3>🔥 Longest Streak</h3><div id="hofStreakRows"><p class="pub-empty">Loading...</p></div></div>
+    <div class="pub-card"><h3>🎯 Most Rounds Entered</h3><div id="hofEnteredRows"><p class="pub-empty">Loading...</p></div></div>
+    <div class="pub-card"><h3>📅 Recent Winners</h3><div id="hofRecentRows"><p class="pub-empty">Loading...</p></div></div>
+  </div>
+  <div class="pub-card">
+    <h3>🔥 Hall of Bangers</h3>
+    <p style="font-size:.74rem;color:var(--muted);margin-bottom:10px;">Highest-rated tracks from Hot or Not sessions</p>
+    <div id="bangersRows"><p class="pub-empty">Loading...</p></div>
+  </div>
+</section>
+
+<!-- ─── FIGHT CARD ─── -->
+<section class="pub-section" id="sec-fightcard">
+  <div class="pub-section-title">🥊 Fight Card</div>
+  <p style="color:var(--muted);font-size:.82rem;margin-bottom:18px;">Most recent Beat Challenge rounds — newest on top.</p>
+  <div id="fightCardRows"><p class="pub-empty">Loading...</p></div>
+</section>
+
+<!-- ─── WORLD MAP ─── -->
+<section class="pub-section" id="sec-worldmap">
+  <div class="pub-section-title">🗺️ Community Map</div>
+  <p style="color:var(--muted);font-size:.82rem;margin-bottom:14px;">Drop a pin — show the world where you're making beats from. Pins are shared with everyone who visits.</p>
+  <div class="pub-map-wrap"><svg id="pubMapSvg" viewBox="0 0 960 480" xmlns="http://www.w3.org/2000/svg"></svg></div>
+  <div class="pub-map-add">
+    <label>Your name<input type="text" id="pubPinName" class="pub-input" placeholder="e.g. priior_" style="margin-top:4px;"></label>
+    <label>Location<select id="pubPinLoc" class="pub-input" style="margin-top:4px;"></select></label>
+    <button class="pub-btn" style="flex:none;width:auto;padding:.55rem 1.4rem;" onclick="pubAddPin()">📍 Add Pin</button>
+  </div>
+  <div class="pub-map-pin-list">
+    <h3>📌 Pinned Locations</h3>
+    <div id="pubPinListBody"><p class="pub-empty">No pins yet — be the first!</p></div>
+  </div>
+</section>
+
+<!-- ─── TOOLS ─── -->
+<section class="pub-section" id="sec-tools">
+  <div class="pub-section-title">🎛️ Producer Tools</div>
+  <div class="tools-grid">
+
+    <!-- TAP TEMPO -->
+    <div class="pub-card">
+      <div class="tool-title">🥁 Tap Tempo</div>
+      <button class="tap-btn" id="tapBtn" onclick="tap()">TAP</button>
+      <div class="pub-result" id="tapResult">—</div>
+      <div class="pub-result-sub" id="tapSub">Tap at least twice to detect BPM</div>
+      <button class="pub-btn sec" onclick="resetTap()">Reset</button>
+    </div>
+
+    <!-- BPM CALCULATOR -->
+    <div class="pub-card">
+      <div class="tool-title">🎚️ BPM Calculator</div>
+      <input type="number" id="bpmCalcInput" class="pub-input" placeholder="Enter BPM (e.g. 128)" min="60" max="300" oninput="calcBPM()">
+      <div id="bpmCalcResult" style="margin-top:10px;font-size:.8rem;line-height:1.9;color:var(--paper);"></div>
+    </div>
+
+    <!-- 30 MINUTE BEAT TIMER -->
+    <div class="pub-card">
+      <div class="tool-title">⏱️ 30 Minute Beat Timer</div>
+      <div class="pub-result" id="beatTimerDisplay">30:00</div>
+      <div class="pub-result-sub" id="beatTimerSub">Beat Night pace — make something in 30</div>
+      <div class="timer-presets" id="timerPresets">
+        <button class="timer-preset" data-mins="10" onclick="setBeatTimer(10,this)">10</button>
+        <button class="timer-preset" data-mins="15" onclick="setBeatTimer(15,this)">15</button>
+        <button class="timer-preset active" data-mins="30" onclick="setBeatTimer(30,this)">30</button>
+        <button class="timer-preset" data-mins="45" onclick="setBeatTimer(45,this)">45</button>
+        <button class="timer-preset" data-mins="60" onclick="setBeatTimer(60,this)">60</button>
+      </div>
+      <button class="pub-btn" id="beatTimerBtn" onclick="toggleBeatTimer()">▶ START</button>
+      <button class="pub-btn sec" onclick="resetBeatTimer()">Reset</button>
+    </div>
+
+    <!-- KEY / SCALE CHART -->
+    <div class="pub-card" style="grid-column:1/-1;">
+      <div class="tool-title">🎹 Key &amp; Scale Reference</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+        <select class="key-select" id="rootSelect" style="flex:1;" onchange="renderKeyChart()">
+          <option>C</option><option>C#/Db</option><option>D</option><option>D#/Eb</option>
+          <option>E</option><option>F</option><option>F#/Gb</option><option>G</option>
+          <option>G#/Ab</option><option>A</option><option>A#/Bb</option><option>B</option>
+        </select>
+        <select class="key-select" id="scaleSelect" style="flex:1;" onchange="renderKeyChart()">
+          <option value="major">Major</option>
+          <option value="minor">Natural Minor</option>
+          <option value="dorian">Dorian</option>
+          <option value="phrygian">Phrygian</option>
+          <option value="mixolydian">Mixolydian</option>
+          <option value="pentatonic_maj">Major Pentatonic</option>
+          <option value="pentatonic_min">Minor Pentatonic</option>
+          <option value="blues">Blues Scale</option>
+        </select>
+      </div>
+      <div class="key-grid" id="keyGrid"></div>
+      <div id="chordGuide" style="margin-top:12px;font-size:.74rem;color:var(--muted);line-height:1.7;"></div>
+    </div>
+
+    <!-- BEAT NAME GENERATOR -->
+    <div class="pub-card" style="grid-column:1/-1;">
+      <div class="tool-title">✨ Beat Name Generator</div>
+      <div class="beat-name-display" id="beatNameDisplay">Hit Generate</div>
+      <button class="pub-btn" onclick="generateBeatName()">🎲 Generate Name</button>
+    </div>
+
+    <!-- STREAMLOOTS SUPPORT -->
+    <div class="support-section">
+      <div class="support-tagline">
+        <div class="sup-kicker">⚡ Power-Ups &amp; Chaos</div>
+        <h2>Don't Just Watch the Battle — Change It.</h2>
+        <p>Beat Off Cards let you flip the script mid-round. Swap samples, hijack BPMs, veto a submission, or drop a wildcard that nobody saw coming. This is how the crowd becomes part of the show.</p>
+
+        <!-- 4 card showcase -->
+        <div class="cards-row" style="margin-bottom:24px;">
+
+          <div class="sl-card card-chaos" onclick="window.open('https://www.streamloots.com/brightsidemovement/collection/62087de236c8db003bd0d9a2','_blank')">
+            <div class="sl-card-inner">
+              <div class="sl-card-glow"></div>
+              <div class="sl-card-art">
+                <div class="sl-card-corner">BEAT OFF</div>
+                <div class="sl-card-rarity">RARE</div>
+                🌀
+              </div>
+              <div class="sl-card-bottom">
+                <div class="sl-card-name">SAMPLE SWAP</div>
+                <div class="sl-card-desc">Force any producer to drop their current sample and start fresh. Mid-round. No mercy.</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="sl-card card-tempo" onclick="window.open('https://www.streamloots.com/brightsidemovement/collection/62087de236c8db003bd0d9a2','_blank')">
+            <div class="sl-card-inner">
+              <div class="sl-card-glow"></div>
+              <div class="sl-card-art">
+                <div class="sl-card-corner">BEAT OFF</div>
+                <div class="sl-card-rarity">UNCOMMON</div>
+                ⚡
+              </div>
+              <div class="sl-card-bottom">
+                <div class="sl-card-name">TEMPO TWIST</div>
+                <div class="sl-card-desc">The BPM shifts. All producers must adapt or crumble. You set the new pace.</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="sl-card card-wild" onclick="window.open('https://www.streamloots.com/brightsidemovement/collection/62087de236c8db003bd0d9a2','_blank')">
+            <div class="sl-card-inner">
+              <div class="sl-card-glow"></div>
+              <div class="sl-card-art">
+                <div class="sl-card-corner">BEAT OFF</div>
+                <div class="sl-card-rarity">LEGENDARY</div>
+                🃏
+              </div>
+              <div class="sl-card-bottom">
+                <div class="sl-card-name">WILDCARD</div>
+                <div class="sl-card-desc">Mystery effect. Could be anything. The host decides your fate in real time.</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="sl-card card-veto" onclick="window.open('https://www.streamloots.com/brightsidemovement/collection/62087de236c8db003bd0d9a2','_blank')">
+            <div class="sl-card-inner">
+              <div class="sl-card-glow"></div>
+              <div class="sl-card-art">
+                <div class="sl-card-corner">BEAT OFF</div>
+                <div class="sl-card-rarity">UNCOMMON</div>
+                🚫
+              </div>
+              <div class="sl-card-bottom">
+                <div class="sl-card-name">VETO VOTE</div>
+                <div class="sl-card-desc">Eliminate one submission from contention. One producer hears their name called. Not in a good way.</div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+        <a class="sup-cta-btn" href="https://www.streamloots.com/brightsidemovement/collection/62087de236c8db003bd0d9a2" target="_blank" rel="noopener">🃏 Get Your Cards</a>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<div class="pub-footer">Beat Night Community Hub &nbsp;·&nbsp; Built with ❤️ for producers</div>
+
+<script>
+/* ── SECTION NAV ── */
+function showSection(id, btn){
+  document.querySelectorAll('.pub-section').forEach(s=>s.classList.remove('active'));
+  document.querySelectorAll('.pub-nav-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('sec-'+id).classList.add('active');
+  btn.classList.add('active');
+}
+
+/* ── TAP TEMPO ── */
+let tapTimes = [];
+function tap(){
+  tapTimes.push(Date.now());
+  if(tapTimes.length>8) tapTimes.shift();
+  if(tapTimes.length<2){ document.getElementById('tapSub').textContent='Keep tapping…'; return; }
+  const gaps = [];
+  for(let i=1;i<tapTimes.length;i++) gaps.push(tapTimes[i]-tapTimes[i-1]);
+  const avg = gaps.reduce((a,b)=>a+b,0)/gaps.length;
+  const bpm = Math.round(60000/avg);
+  document.getElementById('tapResult').textContent = bpm + ' BPM';
+  document.getElementById('tapSub').textContent = `${tapTimes.length} taps · avg interval ${Math.round(avg)}ms`;
+  // Halftime/doubletime hints
+}
+function resetTap(){ tapTimes=[]; document.getElementById('tapResult').textContent='—'; document.getElementById('tapSub').textContent='Tap at least twice to detect BPM'; }
+
+/* ── BPM CALCULATOR ── */
+function calcBPM(){
+  const bpm = parseFloat(document.getElementById('bpmCalcInput').value);
+  const el = document.getElementById('bpmCalcResult');
+  if(!bpm||bpm<20){ el.innerHTML=''; return; }
+  const bar4 = (60/bpm)*4;
+  const eighth = 60/bpm/2;
+  const sixteenth = 60/bpm/4;
+  const triplet = 60/bpm/3;
+  const half = bpm/2, dbl = bpm*2, third = Math.round(bpm*2/3);
+  el.innerHTML = `
+    <strong>Note lengths (seconds):</strong><br>
+    Quarter note: ${(60/bpm).toFixed(3)}s &nbsp; 8th: ${eighth.toFixed(3)}s &nbsp; 16th: ${sixteenth.toFixed(3)}s &nbsp; Triplet: ${triplet.toFixed(3)}s<br>
+    4-bar loop: ${bar4.toFixed(2)}s &nbsp; 8-bar: ${(bar4*2).toFixed(2)}s &nbsp; 16-bar: ${(bar4*4).toFixed(2)}s<br>
+    <strong>Related tempos:</strong> Half-time ${half} · Double-time ${dbl} · ⅔ feel ${third}`;
+}
+
+/* ── KEY CHART ── */
+const NOTES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const SCALES = {
+  major:          [0,2,4,5,7,9,11],
+  minor:          [0,2,3,5,7,8,10],
+  dorian:         [0,2,3,5,7,9,10],
+  phrygian:       [0,1,3,5,7,8,10],
+  mixolydian:     [0,2,4,5,7,9,10],
+  pentatonic_maj: [0,2,4,7,9],
+  pentatonic_min: [0,3,5,7,10],
+  blues:          [0,3,5,6,7,10],
+};
+const CHORD_QUALITIES = {
+  major:[['I','maj'],['ii','min'],['iii','min'],['IV','maj'],['V','maj'],['vi','min'],['vii°','dim']],
+  minor:[['i','min'],['ii°','dim'],['III','maj'],['iv','min'],['v','min'],['VI','maj'],['VII','maj']],
+};
+function renderKeyChart(){
+  const rootName = document.getElementById('rootSelect').value;
+  const scale = document.getElementById('scaleSelect').value;
+  const rootIdx = NOTES.findIndex(n=>n===rootName.split('/')[0]);
+  const intervals = SCALES[scale]||SCALES.major;
+  const scaleNotes = intervals.map(i=>NOTES[(rootIdx+i)%12]);
+  const grid = document.getElementById('keyGrid');
+  grid.style.gridTemplateColumns = `repeat(${NOTES.length},1fr)`;
+  grid.innerHTML = NOTES.map(n=>`<div class="key-cell ${scaleNotes.includes(n)?(n===rootName.split('/')[0]?'root':'lit'):''}"
+    style="${scaleNotes.includes(n)&&n!==rootName.split('/')[0]?'background:var(--panel-2);border-color:var(--cyan);':''}">${n}</div>`).join('');
+  // Chord guide for major/minor
+  const cg = document.getElementById('chordGuide');
+  const cqKey = scale==='major'?'major':scale==='minor'?'minor':null;
+  if(cqKey && CHORD_QUALITIES[cqKey]){
+    const chords = CHORD_QUALITIES[cqKey].map(([numeral,q],idx)=>{
+      const note = scaleNotes[idx]||'?';
+      return `${numeral} — ${note} ${q}`;
+    });
+    cg.innerHTML = '<strong>Chord guide:</strong> &nbsp;'+chords.join(' &nbsp;·&nbsp; ');
+  } else { cg.innerHTML=''; }
+}
+renderKeyChart();
+
+/* ── BEAT NAME GENERATOR ── */
+const ADJECTIVES = ['Midnight','Golden','Dusty','Electric','Hollow','Sacred','Broken','Liquid','Frozen','Sunken','Cosmic','Blazing','Silent','Velvet','Rusted','Ancient','Crystal','Neon','Shadow','Phantom'];
+const NOUNS      = ['Cathedral','Signal','Archive','Wave','Gospel','Circuit','Monument','Frequency','Echo','Chapter','Ritual','Pressure','Fragment','Current','Temple','Protocol','Frequency','Axis','Layer','Vault'];
+const SUFFIXES   = ['Vol. I','(Instrumental)','Refix','Extended','Interlude','Flip','Reprise','Draft','Sketch','Mix','001','Outro','Intro','Cut'];
+function generateBeatName(){
+  const a = ADJECTIVES[Math.floor(Math.random()*ADJECTIVES.length)];
+  const n = NOUNS[Math.floor(Math.random()*NOUNS.length)];
+  const addSuffix = Math.random()>0.45;
+  const s = SUFFIXES[Math.floor(Math.random()*SUFFIXES.length)];
+  document.getElementById('beatNameDisplay').textContent = addSuffix ? `${a} ${n} ${s}` : `${a} ${n}`;
+}
+
+/* ── 30 MINUTE BEAT TIMER ── */
+// Counts down from a wall-clock deadline rather than decrementing a counter, so
+// it stays accurate when the tab is backgrounded and setInterval gets throttled.
+let btMinutes = 30, btEndsAt = null, btRemaining = 30*60*1000, btTick = null;
+
+function btFmt(ms){
+  const t = Math.max(0, Math.round(ms/1000));
+  return String(Math.floor(t/60)).padStart(2,'0') + ':' + String(t%60).padStart(2,'0');
+}
+function btPaint(){
+  const disp = document.getElementById('beatTimerDisplay');
+  const ms = btEndsAt ? btEndsAt - Date.now() : btRemaining;
+  disp.textContent = btFmt(ms);
+  if(btEndsAt && ms <= 0){
+    btStop();
+    btRemaining = 0;
+    disp.classList.add('timer-done');
+    document.getElementById('beatTimerSub').textContent = "TIME'S UP — bounce it!";
+    document.getElementById('beatTimerBtn').textContent = '▶ START';
+    try{ btBeep(); }catch(e){}
+  }
+}
+function btStop(){ clearInterval(btTick); btTick = null; btEndsAt = null; }
+
+// Short triple blip via WebAudio — no asset to load, works offline.
+function btBeep(){
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if(!Ctx) return;
+  const ctx = new Ctx();
+  [0, 0.25, 0.5].forEach(off=>{
+    const osc = ctx.createOscillator(), gain = ctx.createGain();
+    osc.frequency.value = 880; osc.type = 'square';
+    gain.gain.setValueAtTime(0.18, ctx.currentTime + off);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + off + 0.18);
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.start(ctx.currentTime + off); osc.stop(ctx.currentTime + off + 0.2);
+  });
+  setTimeout(()=>ctx.close(), 1500);
+}
+
+function setBeatTimer(mins, btn){
+  btMinutes = mins;
+  btStop();
+  btRemaining = mins * 60 * 1000;
+  document.querySelectorAll('.timer-preset').forEach(b=>b.classList.toggle('active', b === btn));
+  document.getElementById('beatTimerDisplay').classList.remove('timer-done');
+  document.getElementById('beatTimerBtn').textContent = '▶ START';
+  document.getElementById('beatTimerSub').textContent = `${mins} minutes on the clock`;
+  btPaint();
+}
+
+function toggleBeatTimer(){
+  const btn = document.getElementById('beatTimerBtn');
+  if(btTick){                                   // running -> pause
+    btRemaining = Math.max(0, btEndsAt - Date.now());
+    btStop();
+    btn.textContent = '▶ RESUME';
+    document.getElementById('beatTimerSub').textContent = 'Paused';
+    return;
+  }
+  if(btRemaining <= 0) btRemaining = btMinutes * 60 * 1000;
+  btEndsAt = Date.now() + btRemaining;
+  document.getElementById('beatTimerDisplay').classList.remove('timer-done');
+  btn.textContent = '⏸ PAUSE';
+  document.getElementById('beatTimerSub').textContent = 'Clock is running — go';
+  btTick = setInterval(btPaint, 250);
+  btPaint();
+}
+
+function resetBeatTimer(){
+  btStop();
+  btRemaining = btMinutes * 60 * 1000;
+  document.getElementById('beatTimerDisplay').classList.remove('timer-done');
+  document.getElementById('beatTimerBtn').textContent = '▶ START';
+  document.getElementById('beatTimerSub').textContent = `${btMinutes} minutes on the clock`;
+  btPaint();
+}
+
+/* ── PUBLIC WORLD MAP ── */
+const PUB_LOC_GROUPS=['US States','Africa','Asia','Europe','North America','South America','Oceania','Antarctica','Other'];
+
+function pubInitMap(){
+  // Build SVG from pre-computed paths
+  const svg = document.getElementById('pubMapSvg');
+  if(!svg||typeof PUB_MAP_PATHS==='undefined') return;
+  const countryPaths = PUB_MAP_PATHS.map(p=>`<path class="pub-map-country" d="${p.d}" data-n="${p.n.replace(/"/g,'&quot;')}"/>`).join('');
+  svg.innerHTML = `<g>${countryPaths}</g><g id="pubPinsLayer"></g>`;
+
+  // Build dropdown grouped by continent
+  const sel = document.getElementById('pubPinLoc');
+  const byGroup={};
+  (PUB_MAP_LOCS||[]).forEach((l,i)=>{
+    if(!byGroup[l.continent]) byGroup[l.continent]=[];
+    byGroup[l.continent].push({...l,idx:i});
+  });
+  let opts='';
+  PUB_LOC_GROUPS.forEach(g=>{
+    if(!byGroup[g]) return;
+    const label = g==='US States'?'🇺🇸 United States (by State)':g;
+    opts+=`<optgroup label="${label}">`;
+    byGroup[g].sort((a,b)=>a.name.localeCompare(b.name)).forEach(l=>{
+      opts+=`<option value="${l.idx}">${l.name}</option>`;
+    });
+    opts+='</optgroup>';
+  });
+  sel.innerHTML = opts;
+}
+
+function pubRenderPins(pins){
+  const layer = document.getElementById('pubPinsLayer');
+  if(!layer) return;
+  const groups={};
+  pins.forEach(p=>{ if(!groups[p.loc]) groups[p.loc]={px:p.px,py:p.py,names:[]}; groups[p.loc].names.push(p.name); });
+  layer.innerHTML = Object.entries(groups).map(([loc,g])=>`
+    <circle class="pub-map-pin" cx="${g.px}" cy="${g.py}" r="6">
+      <title>${loc}: ${g.names.join(', ')}</title>
+    </circle>`).join('');
+
+  const body = document.getElementById('pubPinListBody');
+  const locs = Object.keys(groups).sort();
+  if(!locs.length){ body.innerHTML='<p class="pub-empty">No pins yet — be the first!</p>'; return; }
+  body.innerHTML = locs.map(loc=>{
+    const chips = groups[loc].names.map((n,i)=>`<span class="pub-pin-chip">${n}<button onclick="pubRemovePin('${loc}','${n}')">✕</button></span>`).join('');
+    return `<div class="pub-pin-group"><div class="pub-pin-loc">${loc}</div><div class="pub-pin-names">${chips}</div></div>`;
+  }).join('');
+}
+
+function pubLoadPins(){
+  try{ const saved=JSON.parse(localStorage.getItem('beatNightPubPins')||'[]'); pubRenderPins(saved); }
+  catch(e){ pubRenderPins([]); }
+}
+
+function pubAddPin(){
+  const name = document.getElementById('pubPinName').value.trim();
+  const idx  = parseInt(document.getElementById('pubPinLoc').value);
+  if(!name){ alert('Enter your name first'); return; }
+  const loc = (PUB_MAP_LOCS||[])[idx];
+  if(!loc){ alert('Pick a location'); return; }
+  try{
+    const pins = JSON.parse(localStorage.getItem('beatNightPubPins')||'[]');
+    if(!pins.find(p=>p.name===name&&p.loc===loc.name)){
+      pins.push({name, loc:loc.name, px:loc.px, py:loc.py});
+      localStorage.setItem('beatNightPubPins', JSON.stringify(pins));
+    }
+    pubRenderPins(pins);
+    document.getElementById('pubPinName').value='';
+  }catch(e){}
+}
+
+function pubRemovePin(loc,name){
+  try{
+    let pins = JSON.parse(localStorage.getItem('beatNightPubPins')||'[]');
+    pins = pins.filter(p=>!(p.loc===loc&&p.name===name));
+    localStorage.setItem('beatNightPubPins', JSON.stringify(pins));
+    pubRenderPins(pins);
+  }catch(e){}
+}
+
+</script>
+<script>
+const PUB_MAP_PATHS=[{"n":"Afghanistan","d":"M627.372,133.851L631.777,134.596L633.831,132.778L635.015,129.503L637.062,127.867L639.093,128.759L642.369,129.414L644.703,128.819L646.101,128.016L647.804,127.629L648.572,125.4L649.975,127.005L651.082,129.622L652.936,129.979L655.115,128.343L659.284,128.581L658.612,129.771L654.844,130.664L651.295,132.6L652.735,135.341L652.153,137.727L649.378,138.712L649.336,141.428L649.125,145.041L647.375,145.608L645.446,146.833L642.558,148.506L639.923,152.3L637.772,152.689L633.846,152.749L631.293,148.506L628.85,146.086L627.168,141.816L626.787,139.726Z"},{"n":"Angola","d":"M521.805,257.444L523.127,261.421L524.66,263.944L527.199,263.291L529.018,262.964L531.264,261.124L532.703,260.59L535.581,261.629L536.103,264.657L535.867,268.25L536.498,272.884L538.235,272.705L540.969,272.438L540.892,274.785L540.909,277.312L535.797,278.292L537.077,290.192L533.999,293.259L526.167,291.413L515.542,291.741L512.407,290.311L509.658,291.383L509.855,286.888L510.928,282.902L512.405,279.006L514.714,275.736L514.916,271.844L513.493,268.992L513.031,266.587L513.065,262.549L511.302,258.661L512.613,257.711L514.253,257.385ZM511.85,256.85L511.183,257.177L510.503,254.951L511.559,253.675L512.33,253.171L513.298,254.18L512.348,254.803L511.934,255.574Z"},{"n":"Albania","d":"M528.294,115.42L528.512,117.695L529.544,119.203L528.749,120.595L527.323,121.84L525.86,120.18L525.597,116.749L525.428,115.361L526.119,112.972L526.912,113.267L528.048,114.358Z"},{"n":"United Arab Emirates","d":"M608.599,167.894L609.193,168.58L613.168,168.192L616.172,166.251L619.165,162.488L620.388,165.893L619.114,167.834L618.552,168.849L618.065,171.296L617.702,173.117L608.772,168.61Z"},{"n":"Argentina","d":"M337.632,403.049L335.616,403.188L334.163,402.21L332.826,402.126L330.495,402.126L328.293,395.846L329.577,397.148L331.407,399.264L334.836,400.95L338.132,401.65ZM317.242,305.63L319.642,305.362L322.988,306.137L330.255,311.45L336.263,314.824L334.915,320.678L340.351,321.963L344.212,319.184L345.475,315.988L347.144,320.081L343.765,322.949L338.641,329.941L338.217,335.377L338.292,339.02L338.515,342.511L342.07,347.132L343.928,349.872L339.131,355.283L331.803,355.609L332.681,359.583L332.258,362.128L327.437,361.448L327.732,365.17L330.577,365.111L329.717,367.558L328.721,372.347L326.412,373.929L324.969,377.609L330.184,380.343L327.941,384.572L325.823,389.061L327.037,393.375L328.099,394.882L320.409,394.058L318.202,390.264L315.623,389.405L315.705,385.091L315.097,381.794L315.219,375.449L315.317,373.167L313.519,371.497L312.556,369.147L311.86,365.141L310.314,358.516L311.47,354.778L309.432,349.157L310.22,344.718L310.467,339.05L307.601,333.376L307.831,327.401L309.411,321.873L309.961,318.856L309.526,312.913L312.492,308.345L313.871,304.884Z"},{"n":"Armenia","d":"M582.579,117.695L586.394,117.99L587.025,119.262L587.929,121.217L590.198,122.521L589.727,124.658L588.439,122.492L586.56,121.691L585.015,120.891L583.143,118.73Z"},{"n":"Antarctica","d":"M376.75,465.682L376.929,466.737L377.063,467.65L373.264,467.368L369.532,467.489L366.884,466.818L366.823,466.737L365.434,466.139L369.367,466.201L373.24,466.408L373.946,465.556L374.39,464.82ZM202.127,464.544L199.24,464.82L195.703,464.075L193.429,463.322L193.148,463.192L191.073,462.605L190.818,461.772L194.661,462.124L197.488,462.802L200.084,463.581ZM399.791,461.397L403.705,463.667L404.888,465.661L399.972,466.818L393.662,467.711L386.86,466.9L390.026,465.493L391.752,463.861L392.827,462.299L393.556,461.397L396.894,460.909ZM253.792,450.866L256.56,451.25L258.394,450.818L258.117,451.656L256.96,452.276L254.197,452.086L251.53,451.25L251.53,451.25L251.139,450.434ZM245.627,450.818L249.394,451.752L248.203,451.656L245.59,451.441L242.368,450.77L242.368,450.77L243.214,450.266ZM292.395,447.063L294.731,447.405L296.581,447.112L298.709,448.5L297.096,448.306L294.868,448.403L292.475,448.306L290.041,448.452L287.761,447.99L285.97,446.965L286.848,446.549L289.499,446.867ZM349.051,444.678L349.984,446.745L347.888,447.99L343.526,448.403L341.907,447.795L338.134,447.405L339.002,445.443L340.158,445.147L342.317,443.985L340.889,441.069L342.993,439.485L345.388,441.345L347.956,443.564ZM189.687,474.411L189.827,474.424L192.731,473.99L192.859,473.411L193.367,473.445L197.785,473.445L201.795,473.039L205.849,473.645L215.785,474.598L228.249,475.423L239.273,475.319L247.418,475.349L248.936,474.184L236.155,473.744L227.76,472.712L225.111,471.178L222.316,469.695L215.851,468.488L216.384,467.971L223.453,468.33L226.959,466.982L225.246,465.452L218.56,464.246L211.14,463.818L205.016,462.802L199.158,461.353L196.079,459.023L201.328,459.497L206.592,460.172L210.829,459.452L213.327,458.09L214.614,457.011L212.409,455.318L216.3,455.691L219.957,454.639L224.739,454.357L228.026,453.297L231.309,452.918L235.172,452.775L240.584,453.155L245.403,453.06L250.87,453.202L256.394,453.297L260.061,452.514L264.731,452.633L267.81,451.369L271.089,452.965L274.3,453.06L280.037,454.216L285.197,454.733L290.019,454.404L295.622,455.131L293.944,453.344L289.798,452.324L286.889,450.53L286.484,449.058L291.392,449.058L296.35,450.169L300.423,451.154L304.802,450.338L309.216,450.626L311.911,448.598L316.625,450.121L320.982,450.818L325.935,451.202L329.382,450.818L332.036,450.914L336.669,451.202L340.759,451.752L343.944,450.626L348.51,450.025L352.268,449.155L352.911,447.356L351.109,445.394L348.855,443.439L347.351,441.595L347.504,439.661L347.626,437.638L346.047,435.549L347.238,433.626L349.121,431.871L350.704,429.977L352.516,428.595L355.35,427.626L358.124,426.813L360.212,425.312L363.146,425.681L360.916,427.312L360.916,427.312L358.578,427.469L355.853,428.333L353.984,429.769L354.644,431.768L354.818,433.24L352.323,434.294L350.742,436.188L352.04,438.196L355.294,439.561L358.367,441.345L360.202,443.241L362.472,444.999L364.736,448.16L366.362,450.073L366.157,452.324L363.163,453.438L362.069,455.037L357.56,456.271L353.397,457.264L349.676,458.295L343.69,458.386L341.826,459.272L347.285,460.306L347.438,461.772L342.099,462.124L343.282,463.861L346.922,465.368L353.691,466.469L360.209,467.65L368.324,468.587L376.242,469.695L382.249,471.215L385.109,471.251L389.907,470.115L395.734,469.096L404.216,469.329L408.522,468.94L414.88,468.33L421.084,467.469L428.208,466.818L429.269,465.577L428.025,464.032L421.188,464.459L416.995,463.646L417.288,461.552L422.511,460.508L426.494,459.204L430.256,457.907L433.833,457.402L439.213,457.011L443.489,455.993L447.848,454.733L450.997,453.249L449.378,451.752L451.065,450.025L454.966,448.986L458.201,447.258L460.353,445.443L463.638,446.401L465.93,445.566L468.931,444.851L471.737,445.91L476.563,445.196L479.563,446.352L483.61,445.098L487.928,444.406L492.052,443.439L494.956,442.02L498.395,442.319L500.725,444.357L503.881,442.917L508.426,442.369L510.781,442.369L515.175,441.97L519.337,442.319L522.156,443.29L525.47,443.588L529.927,443.489L534.062,443.092L538.006,442.12L541.946,441.445L544.968,439.384L548.22,438.93L550.285,440.416L553.505,441.094L556.903,441.144L559.769,439.611L564.063,438.424L568.223,437.384L571.733,436.239L575.556,435.652L578.925,434.986L581.466,433.471L585.197,432.259L589.251,431.664L592.772,432.053L593.874,433.883L596.196,435.447L599.484,436.443L602.633,437.283L606.567,435.754L609.981,436.596L613.539,437.079L615.843,439.712L614.673,441.495L610.52,443.067L612.485,443.985L610.295,445.861L609.929,447.649L614.402,447.454L617.099,445.566L620.124,444.084L622.748,441.97L626.344,441.645L630.621,440.944L633.21,439.031L637.34,437.435L640.825,436.086L643.866,435.242L647.627,435.242L651.815,435.089L655.699,432.672L656.243,434.576L659.374,435.294L663.357,435.191L666.596,434.986L669.301,435.703L673.452,435.345L677.33,435.345L680.816,433.626L686.476,430.991L688.577,432.053L690.703,434.525L694.436,434.576L699.198,433.934L703.277,432.466L707.481,431.82L709.078,433.137L712.124,433.832L714.816,435.14L719.309,435.191L723.513,433.574L726.968,433.729L731.038,433.574L734.361,433.832L738.16,433.626L742.772,433.137L747.109,432.879L750.763,431.405L752.431,431.042L751.423,433.291L752.727,434.576L757.758,434.397L762.293,434.243L766.712,434.294L769.358,435.294L768.536,437.003L771.565,438.247L775.856,439.081L779.614,439.51L782.734,439.384L784.433,440.743L788.411,441.294L789.757,442.868L791.884,444.134L796.04,444.233L800.469,444.357L803.42,445.295L805.23,446.5L801.675,448.306L797.642,450.241L792.512,451.609L787.198,452.965L782.665,454.78L778.269,456.457L774.964,458.341L773.461,460.082L772.211,461.684L774.197,462.932L767.021,463.732L760.036,465.031L755.93,466.777L754.609,468.211L753.836,469.734L755.494,470.957L759.006,472.099L761.239,473.31L760.925,473.924L768.817,474.022L770.313,474.411L754.409,478.007L734.033,480L480,480L225.967,480L205.591,478.007Z"},{"n":"French Southern and Antarctic Lands","d":"M636.137,384.341L637.298,385.264L639.335,385.61L639.227,386.158L638.169,387.482L634.671,387.654L635.084,386.129L635.791,384.947Z"},{"n":"Australia","d":"M822.71,361.418L825.941,362.039L829.38,361.684L826.284,366.203L824.334,367.764L821.169,369.647L819.771,367.028L820.536,362.512ZM844.868,280.849L847.211,282.069L848.856,284.478L848.444,288.376L849.095,290.222L848.675,294.302L851.425,297.877L854.246,300.59L854.694,303.184L855.994,305.75L857.393,306.585L858.146,311.599L860.16,315.152L859.562,319.244L859.045,323.636L856.993,327.67L854.689,332.032L851.137,336.9L846.821,340.691L843.51,344.718L840.275,348.443L838.649,351.449L834.039,352.579L829.587,354.956L826.213,354.897L826.105,352.846L821.424,355.55L818.633,354.273L815.464,353.203L815.334,349.098L814.755,346.387L813.989,344.599L812.29,344.45L811.848,343.347L814.433,340.154L812.146,340.483L808.346,343.883L807.647,341.079L806.108,337.796L804.347,335.288L800.834,333.765L792.824,335.109L787.451,335.915L781.991,338.125L779.656,340.9L775.954,341.229L772.151,341.02L768.448,342.75L766.287,343.466L763.073,344.301L759.527,342.392L759.058,340.095L761.011,339.02L762.235,335.885L762.139,331.076L762.831,327.67L762.577,324.861L762.113,321.306L761.264,317.691L761.874,316.197L763.339,318.229L763.01,314.346L762.615,312.495L763.961,310.047L764.729,306.824L765.93,306.943L769.642,303.9L773.257,301.514L775.062,301.663L778.869,300.202L780.081,299.278L784.289,298.474L786.852,295.583L788.933,292.872L791.457,288.734L793.279,290.698L793.653,287.841L795.328,286.234L797.735,283.586L799.252,282.247L800.45,281.861L802.932,281.028L805.746,284.151L808.898,284.448L810.184,280.433L811.134,278.917L814.148,276.152L817.638,275.944L816.012,273.448L819.031,273.775L822.275,275.736L824.51,276.36L827.034,275.766L828.671,276.658L826.649,279.452L825.875,280.731L823.761,283.705L825.558,286.174L828.45,288.168L830.683,289.924L832.057,291.592L836.152,291.592L837.702,288.674L839.514,284.657L839.745,282.366L840.384,278.411L840.714,276.836L842.244,273.626L843.51,271.665L843.978,274.964L844.49,276.598L845.137,279.779Z"},{"n":"Austria","d":"M518.566,97.105L517.198,98.293L517.054,100.79L514.665,101.343L511.645,101.78L507.749,100.005L505.288,101.081L502.704,100.587L501.966,99.337L502.553,98.67L504.013,98.699L507.638,98.322L509.474,98.989L509.226,96.613L510.756,94.909L513.68,94.678L516.282,95.342L518.416,95.717Z"},{"n":"Azerbaijan","d":"M586.56,121.691L587.395,122.492L588.439,122.492L588.509,122.937L589.727,124.658L588.051,124.272L586.625,122.877L586.076,121.78ZM591.434,117.31L592.795,116.749L595.496,117.133L598.177,119.351L597.155,120.388L596.899,123.738L596.448,125.905L594.15,124.51L593.885,122.166L590.593,124.569L589.051,122.017L588.439,120.269L587.376,118.523L585.774,117.222L588.167,117.606L589.737,117.428L588.831,115.42Z"},{"n":"Burundi","d":"M555.161,253.349L555.04,249.759L554.383,248.424L555.945,248.662L556.75,246.971L558.108,247.149L558.254,248.335L558.788,248.988L558.806,249.967L558.185,250.59L557.172,252.133L556.213,253.201Z"},{"n":"Belgium","d":"M487.376,87.822L489.03,88.05L491.066,87.451L492.525,88.707L493.773,89.393L493.56,91.312L492.979,91.427L492.774,93.036L490.785,91.714L489.643,91.944L488.047,90.595L486.977,89.45L485.948,89.393L485.6,88.392Z"},{"n":"Benin","d":"M486.885,221.428L484.145,219.737L483.729,212.315L482.756,209.79L482.295,207.354L483.695,205.72L485.476,204.561L487.257,203.669L489.099,206.374L489.185,209.345L488.222,211.988L486.951,214.75Z"},{"n":"Burkina Faso","d":"M472.775,211.394L469.841,210.741L467.798,210.859L466.223,209.226L466.747,206.225L468.724,202.778L469.805,200.013L472.119,199.805L474.438,197.693L477.285,195.552L479.315,195.7L480.762,197.128L482.518,200.399L485.548,202.51L484.943,205.452L483.161,207.027L480.051,207.295L478.062,207.532L472.503,207.473Z"},{"n":"Bangladesh","d":"M712.205,174.489L711.552,176.16L711.139,177.024L710.031,174.071L706.386,172.192L706.288,175.086L704.85,175.026L703.075,174.429L701.045,169.744L699.469,167.147L701.184,164.937L699.58,161.323L703.008,162.757L706.071,165.266L709.913,165.714L708.15,168.431L709.32,171.655L710.084,169.744Z"},{"n":"Bulgaria","d":"M532.543,108.445L534.186,109.413L539.45,110.03L543.179,108.591L546.395,109.971L544.68,113.296L543.573,114.594L541.391,116.985L537.516,116.247L533.959,116.956L532.379,114.063L532.455,113.296L533.578,111.441L532.021,109.09Z"},{"n":"The Bahamas","d":"M286.479,169.356L285.832,169.506L285.475,167.774L284.664,166.908L285.514,165.027L286.241,165.146L286.719,167.625ZM287.115,160.935L284.331,161.413L284.35,160.308L285.556,160.069L287.175,160.158ZM289.153,160.905L288.376,163.026L287.969,162.638L288.28,161.084L287.37,159.889L287.427,159.561Z"},{"n":"Bosnia and Herzegovina","d":"M523.939,106.598L524.292,107.888L525.248,110.383L524.301,110.794L523.37,113.09L520.27,110.736L518.203,109.002L516.412,106.715L517.695,106.188L519.219,105.515L522.828,105.954Z"},{"n":"Belarus","d":"M531.477,80.568L535.857,79.527L537.807,77.035L538.67,75.334L543.22,74.945L544.727,75.306L547.37,77.286L548.684,79.865L549.62,80.905L551.932,82.146L549.394,82.654L549.675,83.871L548.631,85.857L548.114,87.907L545.174,87.765L543.746,87.593L541.08,87.137L536.25,86.226L533.416,87.052L532.173,85.914L532.593,84.012L531.736,81.807Z"},{"n":"Belize","d":"M254.816,187.098L255.167,186.532L256.722,185.072L257.146,185.49L257.496,186.294L257.07,188.051L256.804,189.391L255.746,191.683L254.653,192.814L254.494,189.45Z"},{"n":"Bermuda","d":"M322.167,143.816L322.137,143.846L322.069,143.816L322.107,143.876L322.102,143.906L322.048,143.936L322.019,143.966L321.94,143.995L321.951,143.936L321.932,143.906L321.967,143.846L322.021,143.816L322.055,143.757L321.967,143.846L321.942,143.846L321.913,143.876L321.897,143.966L321.965,143.995L321.989,143.995L322.013,143.995L322.067,143.966L322.17,143.936L322.205,143.876L322.313,143.816L322.372,143.757L322.48,143.697L322.485,143.667L322.515,143.637L322.477,143.577L322.399,143.607L322.369,143.637L322.388,143.667L322.412,143.667L322.431,143.697L322.437,143.667L322.48,143.697L322.397,143.757L322.364,143.667L322.334,143.697L322.304,143.727L322.275,143.757L322.245,143.786L322.191,143.816ZM225.967,0L480,0L734.033,0L755.536,2.181L772.104,6.133L785.558,11.231L797.098,17.068L817.189,30.036L835.409,44.016L868.423,74.028L882.895,89.893L895.749,106.188L906.911,122.774L916.396,139.517L924.261,156.319L930.579,173.117L938.834,206.611L941.542,240L938.834,273.389L930.579,306.883L924.261,323.681L916.396,340.483L906.911,357.226L895.749,373.812L882.895,390.107L868.423,405.972L835.409,435.984L817.189,449.964L797.098,462.932L785.558,468.769L772.104,473.867L755.536,477.819L734.033,480L480,480L225.967,480L204.464,477.819L187.896,473.867L174.442,468.769L162.902,462.932L142.811,449.964L124.591,435.984L91.577,405.972L77.105,390.107L64.251,373.812L53.089,357.226L43.604,340.483L35.739,323.681L29.421,306.883L21.166,273.389L18.458,240L21.166,206.611L29.421,173.117L35.739,156.319L43.604,139.517L53.089,122.774L64.251,106.188L77.105,89.893L91.577,74.028L124.591,44.016L142.811,30.036L162.902,17.068L174.442,11.231L187.896,6.133L204.464,2.181L225.967,0Z"},{"n":"Bolivia","d":"M322.512,305.481L318.95,307.778L313.871,304.884L310.346,307.987L307.114,300.53L306.128,296.387L304.134,292.217L304.106,286.501L304.052,284.389L304.774,280.374L305.211,277.282L304.611,272.765L306.439,271.784L309.882,269.467L313.063,271.19L313.347,274.339L319.147,277.49L321.98,279.184L324.705,280.017L326.457,282.604L327.146,284.776L327.642,288.287L332.269,290.133L334.099,292.128L334.585,296.328L334.432,299.338L333.573,299.04L328.741,297.46L323.475,300.948L322.988,306.137Z"},{"n":"Brazil","d":"M338.641,329.941L343.765,322.949L347.144,320.081L345.475,315.988L344.596,314.824L344.57,311.42L342.718,311.36L341.356,310.077L340.278,306.466L337.549,306.227L334.599,301.604L334.432,299.338L334.585,296.328L334.099,292.128L332.269,290.133L327.642,288.287L327.146,284.776L326.457,282.604L324.705,280.017L321.98,279.184L319.147,277.49L313.347,274.339L313.063,271.19L309.882,269.467L306.439,271.784L304.611,272.765L301.311,273.002L300.034,268.161L295.788,269.824L293.008,268.071L291.977,264.983L291.444,261.777L292.893,259.67L293.207,257.028L296.203,253.616L298.637,252.607L301.968,244.627L301.591,241.631L300.463,238.398L302.438,238.22L301.034,236.767L305.996,234.987L307.561,234.898L308.524,236.292L311.927,237.657L314.346,236.055L315.719,234.305L317.427,232.851L314.92,230.715L313.92,227.956L316.301,228.075L319.093,228.105L323.814,226.532L324.476,224.574L326.382,225.138L326.881,226.888L326.707,229.291L326.907,233.326L328.652,236.085L330.193,235.669L332.172,235.017L334.433,234.483L336.431,234.601L336.263,233.415L337.55,232.822L340.239,233.148L342.138,232.94L343.051,233.919L345.269,232.584L347.643,227.66L349.131,229.173L351.889,234.839L349.999,239.347L355.333,240.712L357.386,241.72L364.858,244.598L365.73,247.979L373.708,248.632L381.344,250.976L386.651,255.159L389.765,256.198L391.17,261.777L389.009,268.636L384.048,276.123L381.631,278.768L381.446,286.531L380.807,293.081L379.881,298.235L377.394,305.213L375,308.286L368.444,309.42L364.097,311.629L359.568,316.974L360.056,320.857L359.522,325.309L355.935,332.211L352.646,336.005L350.618,340.542L350.54,337.438L346.683,333.735L342.996,331.912Z"},{"n":"Brunei","d":"M772.545,226.562L773.522,225.464L775.621,223.832L775.589,225.286L775.516,227.185L774.283,227.096L773.784,228.105Z"},{"n":"Bhutan","d":"M706.553,157.38L707.743,158.336L707.947,160.158L705.959,160.248L703.812,160.039L702.347,160.517L699.892,159.382L699.698,158.784L700.9,156.573L702.07,155.796L703.974,156.513L705.295,156.573Z"},{"n":"Botswana","d":"M544.714,295.077L545.911,297.311L549.68,300.918L550.292,303.87L553.735,305.66L547.724,310.077L545.986,313.211L544.106,314.854L542.178,316.496L538.998,315.511L536.72,315.839L534.845,318.169L531.743,319.812L531.551,316.944L529.552,313.659L532.345,304.825L534.679,294.123L539.519,294.302L541.934,293.14L543.819,292.694Z"},{"n":"Central African Republic","d":"M519.08,217.985L521.653,217.006L522.735,217.718L527.005,215.432L528.051,213.354L531.243,213.265L535.404,208.632L538.279,206.938L540.1,210.057L539.736,212.493L540.839,214.274L544.202,216.768L546.005,219.292L547.761,222.348L550.091,224.485L547.61,224.722L544.741,224.663L543.545,225.464L539.685,226.325L538.148,226.265L535.493,227.482L531.973,226.087L528.489,226.028L527.281,229.618L523.895,228.935L521.042,233.267L520.65,231.071L518.538,228.579L517.09,225.969L517.026,223.832L517.826,220.983Z"},{"n":"Canada","d":"M334.157,101.663L335.706,102.042L337.853,101.984L336.416,103.179L335.52,103.354L332.931,102.129L332.628,101.139L333.744,100.238ZM340.405,94.246L339.305,94.303L336.627,93.41L334.931,92.059L335.795,91.8L338.53,92.518L340.483,93.727ZM200.096,95.977L198.739,96.382L195.744,95.053L195.663,94.044L194.215,93.036L194.281,92.231L192.271,91.714L192.364,90.137L192.943,89.478L194.912,90.108L196.022,90.538L197.96,90.824L198.135,91.829L198.481,93.18L200.052,94.39ZM354.413,89.707L353.983,91.255L354.285,92.863L357.304,92.95L358.106,95.948L359.741,96.989L358.49,101.343L356.049,100.907L356.552,98.177L351.962,100.587L351.891,98.525L344.991,98.612L346.548,96.729L348.144,94.188L353.512,87.993L356.705,87.137ZM189.297,80.202L191.552,79.977L188.738,83.191L189.181,85.459L188.294,85.459L187.816,84.154L187.861,82.852L187.347,81.976L187.77,80.736L188.518,79.836ZM316.32,57.95L314.824,59.364L314.03,59.124L313.885,58.323L314.06,58.136L315.259,57.338L316.065,57.417ZM311.631,56.488L308.473,57.95L307.056,57.896L306.974,57.178L309.131,55.957L311.929,55.984ZM309.149,48.75L310.136,49.503L312.652,51.066L314.073,53.135L316.688,53.792L311.583,54.003L308.308,54.214L304.795,54.029L304.394,52.977L307.822,48.543ZM329.733,44.911L327.448,45.039L327.611,43.787L329.212,42.362L331.185,42.007L332.365,42.717L331.82,43.812L331.4,44.17ZM293.845,39.936L292.043,40.818L289.925,40.061L288.156,40.339L286.282,39.207L288.537,38.43L290.647,37.357L292.204,38.055L293.053,38.505L293.308,38.981ZM304.398,38.956L306.597,39.558L306.183,43.073L310.214,42.946L314.733,38.005L320.012,38.555L321.297,41.045L319.694,43.761L313.872,46.812L309.25,46.426L304.73,49.919L300.151,52.82L294.895,54.108L291.209,56.143L283.477,61.322L279.62,66.601L282.095,69.611L285.267,71.179L290.31,73.418L293.586,75.501L298.862,76.839L299.701,79.527L299.518,85.516L303.838,87.308L306.801,79.921L309.893,77.119L315.157,73.252L315.318,69.062L317.419,64.156L318.92,57.524L323.84,57.63L327.872,57.205L331.254,59.632L335.061,60.892L333.366,66.574L336.045,68.624L342.855,64.102L345.467,65.268L348.174,72.035L349.086,75.334L353.764,77.65L355.058,80.933L357.24,82.372L354.621,86.625L348.802,88.649L341.4,91.456L333.418,90.824L328.495,93.094L320.787,98.206L319.419,100.383L329.717,94.188L334.766,95.313L331.898,100.383L334.655,104.025L341.696,100.325L342.539,103.5L333.664,107.155L327.933,110.442L326.776,107.741L327.694,105.428L323.992,104.142L324.366,99.337L322.15,99.047L318.38,103.5L316.088,105.282L314.841,106.159L307.072,106.188L302.801,108.826L301.341,110.206L296.922,110.206L295.923,111.265L295.721,112.472L289.671,114.387L285.889,115.951L285.105,115.066L286.079,113.738L288.912,110.383L289.677,105.165L288.201,103.295L287.368,102.916L287.196,101.78L286.069,101.984L285.866,101.401L284.491,99.715L281.201,97.626L277.131,97.395L273.876,96.671L270.051,96.151L266.42,95.515L266.202,93.439L264.949,94.563L252.542,94.563L238.079,94.563L224.633,94.563L215.525,94.563L202.395,94.563L199.332,91.743L195.104,89.307L196.831,85.033L195.851,81.553L195.495,78.07L198.807,74.945L196.491,70.051L195.643,66.847L195.069,64.318L189.016,66.711L188.047,63.75L184.63,62.912L207.109,38.43L212.007,40.238L216.541,39.408L222.235,38.931L229.901,37.232L232.243,37.681L234.846,36.759L240.182,37.307L241.484,38.806L245.086,38.205L250.918,40.187L255.292,40.439L253.146,42.997L261.825,43.226L264.79,44.323L266.697,41.956L271.078,40.969L273.963,41.323L277.275,42.489L283.288,43.226L286.946,41.728L291.455,42.133L292.44,42.514L296.542,40.036L293.934,37.481L299.523,32.962L302.921,34.434L301.121,38.455ZM266.118,30.048L269.023,30.434L273.752,30.434L274.384,33.623L276.866,30.12L280.37,30.144L280.979,33.5L282.502,36.461L284.102,38.756L281.33,39.91L276.758,40.439L271.541,39.91L261.993,41.146L258.223,40.187L254.149,39.785L254.932,37.531L260.868,37.232L260.497,36.213L253.555,36.362L258.612,34.459L252.883,33.844L258.287,31.039ZM284.82,29.326L281.878,30.918L280.343,29.23L281.258,28.894L283.836,28.798ZM336.959,30.096L336.744,30.748L334.796,30.676L332.796,30.627L330.524,30.966L330.067,30.821L328.8,29.542L329.44,28.678L330.44,28.511L334.541,28.774ZM317.906,29.951L321.394,29.518L328.407,31.014L331.309,31.913L337.121,32.181L338.74,34.409L343.738,35.421L349.056,37.406L345.607,40.919L352.33,43.124L357.19,45.655L351.044,50.466L346.979,46.863L343.33,48.672L347.003,51.379L347.781,54.688L344.005,55.851L341.691,56.037L343.12,58.563L334.232,55.957L333.367,53.924L328.628,51.301L322.213,52.478L323.25,49.659L331.354,49.295L332.483,47.07L336.293,43.43L333.605,41.348L331.695,39.835L328.867,38.13L326.371,38.03L315.99,37.78L309.469,36.685L311.168,34.68L309.531,32.181L315.071,29.038ZM293.346,28.32L295.185,28.822L298.741,28.511L298.695,29.206L296.079,30.361L298.14,31.402L296.2,33.599L292.384,34.557L290.716,34.336L290.094,33.402L286.818,31.524L287.464,30.748L291.073,31.039L290.234,29.47ZM304.795,30.893L301.478,32.717L299.389,32.62L299.778,30.482L300.695,29.278L302.421,28.272L304.764,27.629L308.569,27.7L311.7,28.272L307.393,30.41ZM250.471,34.286L244.36,34.385L242.96,32.059L249.117,28.702L255.364,26.869L262.137,27.486L264.386,29.182L255.328,31.5ZM307.938,25.619L306.221,26.538L303.692,26.349L301.945,25.737L303.759,24.682L306.895,24.054L307.841,24.869ZM302.327,21.591L302.798,22.644L301.867,23.845L299.613,25.572L296.388,25.807L294.732,25.431L295.907,24.077L292.753,24.263L294.205,22.46L296.1,22.529L299.516,21.75L301.925,21.887ZM283.687,22.782L285.607,23.22L286.742,24.449L278.089,25.925L269.65,27.011L274.912,25.197L264.188,25.056L271.287,22.139L277.551,24.286L280.039,22.254L284.111,21.682ZM309.945,20.728L314.865,21.454L314.729,23.081L317.155,24.147L322.066,24.449L329.189,23.752L333.403,24.776L331.613,26.373L326.345,26.609L316.976,27.011L309.876,25.948L310.892,23.52L306.369,22.231L306.345,20.593ZM272.604,19.492L270.522,21.227L268.311,22.025L266.512,22.139L262.123,23.127L258.855,23.474L256.932,22.966L256.932,22.966L261.795,21.272L267.083,19.806L269.794,19.828ZM312.26,19.783L311.38,19.85L308.175,19.694L308.232,19.091L311.81,19.113L312.688,19.537ZM283.444,19.381L279.456,20.03L277.557,19.314L279.753,18.603L282.58,18.382L284.737,18.714ZM286.465,17.395L283.863,17.81L280.927,17.81L281.279,17.504L283.815,16.851L284.646,16.959ZM309.778,18.581L306.723,19.047L305.752,18.537L305.778,17.701L306.502,16.808L308.688,16.894L309.601,17.025L310.983,17.788ZM302.812,18.008L302.645,18.913L299.977,18.669L297.738,17.964L293.879,17.876L296.261,17.22L294.672,16.7L295.421,15.882L298.556,16.161L302.48,16.959ZM328.431,15.117L326.947,16.44L319.018,18.228L314.492,17.068L317.177,15.711L312.757,15.011L314.805,13.161L318.603,12.39L322.454,11.829L325.922,13.345ZM366.421,8.313L374.058,8.694L376.169,9.696L366.963,10.904L368.761,11.334L360.514,13.12L352.383,15.18L345.462,15.84L346.17,16.484L344.59,18.316L339.915,19.806L336.8,21L339.597,21.454L329.528,22.208L321.461,22.276L318.76,21.068L322.93,18.936L328.133,19.738L324.332,17.898L330.05,16.527L329.473,14.948L334.385,13.965L338.918,13.448L329.128,13.325L326.222,11.829L325.26,10.593L330.265,10.152L337.197,9.154L340.367,9.772L345.334,8.475L353.693,8.205L359.475,8.097Z"},{"n":"Switzerland","d":"M501.853,98.815L501.654,100.063L503.874,100.674L502.756,102.362L500.606,103.15L499.101,102.8L496.724,103.908L494.901,102.013L493.824,101.139L495.358,98.786L497.014,98.554L499.383,97.945Z"},{"n":"Chile","d":"M328.293,395.846L332.826,402.126L333.841,403.328L331.194,404.109L327.938,403.049L322.196,401.09L315.175,396.413L321.007,398.898L324.944,398.616L326.585,395.506ZM308.861,303.87L312.098,307.599L312.045,311.45L310.315,317.9L310.856,320.021L308.235,324.682L308.559,330.299L309.729,338.513L310.992,341.795L310.83,347.222L310.056,351.895L310.306,355.876L310.514,361.537L311.082,365.731L313.938,370.264L314.752,372.083L314.46,373.724L315.527,379.297L315.831,383.242L314.387,386.36L316.762,390.436L318.897,392.407L325.883,394.427L326.117,394.853L323.646,396.582L323.346,399.292L317.294,396.413L313.923,394.768L312.594,391.293L308.805,384.485L310.528,379.472L308.167,376.033L310.362,372.2L308.073,365.347L306.784,368.588L305.679,358.901L304.847,353.976L304.834,350.527L305.88,340.96L304.587,332.032L303.927,325.877L304.316,316.466L304.133,303.572L302.398,294.51L304.134,292.217L306.128,296.387L307.114,300.53Z"},{"n":"China","d":"M758.316,184.506L756.381,185.936L754.162,185.013L753.657,182.45L754.658,181.109L757.252,180.275L758.722,180.334L759.479,181.467L758.601,182.778ZM767.221,92.375L775.555,95.342L781.521,98.061L786.064,96.064L786.142,99.744L787.202,105.779L782.689,106.276L786.033,112.265L785.639,113.827L783.177,113.768L781.259,116.571L777.628,115.538L775.106,119.233L771.081,121.988L767.68,124.183L767.414,121.662L766.5,118.109L763.109,121.217L760.169,123.293L761.558,126.678L764.29,128.492L768.365,127.243L772.538,128.492L770.447,130.872L768.143,133.97L770.854,137.697L775.222,143.368L778.298,147.878L778.097,150.298L780.186,153.645L778.951,156.274L777.065,163.444L772.836,169.774L767.162,172.609L764.86,172.968L760.531,175.951L757.701,179.559L755.295,177.561L752.106,175.444L748.344,175.175L746.997,172.251L743.162,170.58L738.969,172.52L735.776,173.236L735.549,177.084L733.851,176.279L731.881,175.921L728.625,174.25L727.215,171.207L723.538,168.938L724.986,162.906L723.973,158.157L721.506,155.677L717.364,155.468L716.322,152.36L712.629,152.868L708.446,156.991L705.295,156.573L702.07,155.796L699.698,158.784L697.641,157.051L691.769,156.095L687.463,154.183L684.895,152.33L679.859,149.462L675.14,148.088L670.965,142.891L672.547,141.786L670.923,137.817L663.265,133.106L659.923,129.444L658.511,126.886L656.697,125.044L654.708,122.61L654.691,121.247L658.067,119.262L661.025,117.754L664.455,116.247L667.817,113.974L668.493,111.53L668.969,105.252L669.756,99.395L675.421,99.047L676.212,95.862L677.961,93.698L681.858,97.25L688.027,100.674L689.755,105.34L695.934,106.247L700.99,108.415L705.062,112.854L712.699,113.473L718.112,113.503L725.094,115.272L728.613,114.623L735.427,113.473L738.733,110.853L739.143,108.914L738.255,105.896L742.315,106.745L746.89,104.054L748.832,101.314L753.931,101.256L750.544,98.177L747.045,98.322L743.45,98.235L742.379,94.188L745.607,93.094L747.058,90.022L748.044,86.084L745.472,83.842L748.863,81.92L755.547,82.682L761.281,86.596L764.716,89.564Z"},{"n":"Ivory Coast","d":"M472.675,225.197L469.731,224.633L465.068,225.197L460.735,227.126L460.435,224.604L460.619,223.061L458.73,221.636L458.535,219.499L458.418,217.184L458.987,215.907L459.044,214.898L459.366,212.166L458.998,209.939L459.843,209.434L462.519,209.909L463.442,209.107L464.56,210.028L466.223,209.226L467.798,210.859L469.841,210.741L472.775,211.394L472.378,218.104L472.804,224.01Z"},{"n":"Cameroon","d":"M513.531,233.267L511.686,233.504L508.916,233.296L505.117,230.893L502.933,228.431L501.749,226.651L502.431,223.743L504.363,220.865L506.861,219.054L510.061,219.292L510.836,216.857L512.577,214.126L513.624,211.394L514.607,207.948L516.859,204.68L516.096,202.956L516.894,201.826L518.122,205.69L519.484,210.384L517.342,210.562L515.618,211.661L518.273,213.888L519.482,217.184L517.826,220.983L517.026,223.832L517.09,225.969L518.538,228.579L520.65,231.071L521.042,233.267L518.84,234.186Z"},{"n":"Democratic Republic of the Congo","d":"M559.007,229.588L559.906,233.474L558.12,235.313L556.615,238.22L555.871,241.75L555.094,244.805L554.649,246.793L555.04,249.759L555.59,256.079L555.8,259.343L558.567,264.746L554.116,264.954L552.666,267.181L552.683,272.022L552.948,275.528L555.427,276.152L553.575,279.333L551.701,276.42L549.206,274.458L545.601,274.964L543.167,273.359L541.86,272.497L539.825,272.26L537.115,272.616L536.691,269.349L535.692,266.438L535.608,263.499L532.46,261.658L531.398,260.59L529.677,261.243L528.626,263.707L526.35,263.707L523.705,262.4L522.401,259.64L514.253,257.385L512.613,257.711L511.183,257.177L511.934,255.574L513.298,254.18L514.839,253.349L516.398,254.209L518.864,252.874L521.028,250.501L522.071,245.161L524.922,242.195L525.282,240.178L525.563,237.449L526.373,232.97L527.281,229.618L528.489,226.028L531.973,226.087L535.493,227.482L538.148,226.265L539.685,226.325L543.545,225.464L544.741,224.663L547.61,224.722L550.091,224.485L552.836,227.274L554.703,226.977L556.734,227.63Z"},{"n":"Republic of the Congo","d":"M513.298,254.18L511.559,253.675L508.415,251.806L509.426,248.217L512.043,247.089L513.606,247.208L516.66,245.932L516.718,241.631L516.613,236.441L514.049,236.114L513.531,233.267L518.84,234.186L521.042,233.267L523.895,228.935L527.281,229.618L526.373,232.97L525.563,237.449L525.282,240.178L524.922,242.195L522.071,245.161L521.028,250.501L518.864,252.874L516.398,254.209L514.839,253.349Z"},{"n":"Colombia","d":"M286.742,240.445L284.385,238.754L281.487,238.814L280.364,237.597L277.487,234.987L278.354,233.267L280.245,231.991L282.365,228.579L281.968,226.147L282.056,222.645L280.788,218.579L281.996,217.332L282.025,214.72L283.654,214.364L286.774,211.988L287.472,208.483L290.625,207.057L292.868,206.671L295.997,204.502L298.224,203.253L298.278,205.036L295.853,207.027L293.996,208.988L292.779,212.849L294.333,214.393L295.01,216.264L294.728,217.985L295.903,219.262L300.683,219.351L303.417,221.577L306.725,221.399L307.118,223.506L306.264,226.651L307.432,229.499L306.191,231.635L307.783,233.326L308.035,236.648L306.853,233.949L300.997,234.928L302.52,237.063L301.926,237.894L300.461,240.564L302.009,243.322L300.947,252.756L298.859,251.094L298.478,246.704L296.013,246.437L292.686,246.852L289.956,242.966L287.409,240.178Z"},{"n":"Costa Rica","d":"M267.922,215.581L266.103,214.304L266.376,213.146L264.746,211.839L263.781,210.592L263.249,210.919L262.157,210.83L261.044,209.939L261.534,208.097L261.482,207.087L263.516,207.503L264.904,207.354L266.018,208.156L267.224,209.137L269.23,211.602L268.167,213.087L268.275,213.859L268.106,215.017Z"},{"n":"Cuba","d":"M274.378,171.058L278.465,171.296L281.501,173.415L284.68,173.773L287.927,176.965L290.163,177.531L291.72,178.516L293.067,180.424L289.655,180.96L284.291,180.99L285.279,178.575L282.935,177.502L281.144,175.921L278.239,174.489L274.261,173.445L272.87,172.55L269.795,174.161L268.033,175.205L268.465,174.012L270.415,172.251L273.726,171.386Z"},{"n":"Northern Cyprus","d":"M558.953,135.371L559.119,135.341L559.41,134.626L561.151,134.686L563.25,133.791L561.742,135.043L561.969,135.61L561.718,135.52L561.281,135.729L560.913,135.669L560.804,135.789L560.726,135.49L560.515,135.312L560.054,135.282L559.426,135.52Z"},{"n":"Cyprus","d":"M561.969,135.61L562.065,135.848L559.723,137.071L558.501,136.683L557.831,135.49L558.953,135.371L559.426,135.52L560.054,135.282L560.515,135.312L560.726,135.49L560.804,135.789L560.913,135.669L561.281,135.729L561.718,135.52Z"},{"n":"Czech Republic","d":"M518.416,95.717L516.282,95.342L513.68,94.678L510.756,94.909L508.203,92.978L507.455,90.91L509.84,89.593L511.934,88.478L513.52,88.507L516.334,89.679L517.516,91.054L519.345,90.652L521.319,91.714L521.799,93.122L520.998,93.785L520.475,94.563L519.707,95.14Z"},{"n":"Germany","d":"M501.594,77.566L503.935,79.303L506.171,79.752L509.893,80.089L511.597,82.428L511.924,84.21L512.477,86.682L512.538,88.821L511.412,89.021L509.056,90.309L507.909,91.771L509.393,93.669L510.02,96.237L509.674,98.496L508.735,98.409L506.048,98.844L503.729,99.482L501.853,98.815L498.951,98.583L497.218,96.498L495.033,93.986L494.028,91.972L493.773,89.393L494.64,86.397L495.622,82.739L495.588,81.187L497.847,81.638L498.728,79.191L500.221,77.986Z"},{"n":"Djibouti","d":"M589.635,202.302L590.286,203.224L590.263,204.472L588.839,205.155L589.968,205.987L589.086,207.562L588.479,207.027L587.876,207.265L586.472,207.206L586.386,206.285L586.151,205.482L586.962,204.085L587.798,202.778L588.903,203.015Z"},{"n":"Denmark","d":"M507.505,75.808L506.349,78.07L503.97,76.505L503.598,75.334L506.719,74.417ZM503.508,73.446L502.387,74.195L501.594,77.566L498.571,77.622L497.422,73.224L498.317,71.648L500.926,70.711L502.611,71.345L502.321,73.03Z"},{"n":"Dominican Republic","d":"M299.466,181.437L301.79,180.93L303.877,181.616L305.604,182.629L306.531,183.613L306.596,185.907L304.3,185.4L302.973,185.787L301.666,185.251L299.566,187.723L298.919,186.413L298.498,184.685L299.51,183.046Z"},{"n":"Algeria","d":"M509.973,170.222L494.303,181.765L487.965,183.374L486.745,180.99L484.574,178.754L467.755,165.744L458.569,157.918L458.645,154.183L465.113,151.523L468.089,149.223L471.087,145.817L473.612,144.473L477.274,142.801L475.808,139.01L474.766,135.282L479.687,133.136L483.526,130.991L491.55,130.217L494.987,129.503L498.546,130.158L499.732,131.527L499.67,136.803L498.476,140.741L500.55,143.219L503.247,149.791L504.277,153.824L504.118,157.619L504.096,161.144L504.64,164.549L505.672,167.505L508.832,168.341Z"},{"n":"Ecuador","d":"M274.211,250.086L274.943,246.585L272.432,246.674L272.497,243.144L273.846,240.831L274.645,237.716L277.811,235.907L280.851,237.538L283.64,239.229L285.64,239.763L287.109,242.699L283.548,247.742L278.984,251.48L277.127,254.714L274.973,252.904L273.822,252.044Z"},{"n":"Egypt","d":"M565.842,152.211L564.925,155.677L563.83,157.738L561.725,155.438L559.388,151.434L562.41,157.589L565.655,163.862L569.05,168.849L568.82,171.326L572.394,174.608L552.722,174.608L542.11,163.623L540.619,150.597L540.665,147.46L544.719,145.967L549.607,147.639L552.58,147.162L555.668,146.056L558.22,147.938L560.718,147.669L563.796,147.072Z"},{"n":"Eritrea","d":"M587.798,202.778L585.771,200.072L583.901,198.08L579.883,196.86L577.778,196.92L575.481,197.812L572.178,195.998L573.221,189.629L575.804,188.23L578.654,189.986L580.945,194.153L586.037,198.675L588.349,201.41L588.903,203.015Z"},{"n":"Spain","d":"M458.822,115.361L458.098,111.971L464.297,110.383L469.872,110.883L475.577,110.824L480.795,113.296L484.283,114.004L487.129,115.331L481.907,117.931L480.26,120.565L480.262,124.658L478.376,127.927L474.844,130.813L469.52,130.783L467.062,132.957L465.018,131.706L462.164,129.533L462.882,127.451L462.446,125.757L462.232,122.017L463.385,120.388L463.878,117.635L464.357,115.361L462.591,115.626L460.664,114.181Z"},{"n":"Estonia","d":"M531.888,69.776L531.18,68.487L529.308,65.948L534.461,64.806L538.983,65.159L538.13,67.229L538.383,70.656L534.618,69.611Z"},{"n":"Ethiopia","d":"M576.194,195.581L579.244,196.236L581.636,196.89L584.61,199.121L586.89,201.797L586.962,204.085L586.386,206.285L587.876,207.265L589.086,207.562L589.566,210.265L591.564,212.76L602.176,216.264L591.822,225.286L587.937,227.452L585.49,228.372L582.111,228.609L579.662,229.618L578.506,229.351L574.427,226.799L571.75,225.82L570.386,223.654L567.632,219.737L565.841,217.125L565.084,215.225L566.799,214.245L567.387,208.453L568.778,206.403L571.274,202.659L572.508,197.188Z"},{"n":"Finland","d":"M535.667,40.061L539.091,43.506L540.551,48.361L541.823,52.557L544.715,56.063L542.567,58.963L534.964,62.615L528.077,64.156L524.521,61.806L523.33,56.753L525.718,53.555L531.196,50.179L527.806,47.844L526.299,42.895L520.189,39.936L523.624,40.616L528.35,41.096L530.616,38.13L536.138,38.28Z"},{"n":"Fiji","d":"M930.952,291.502L931.618,292.366L930.787,293.915L929.112,294.332L927.825,293.945L927.936,292.634L929.152,291.621L930.225,291.979ZM933.853,289.895L932.106,290.52L932.045,289.418L933.461,288.793L934.281,288.644L935.993,287.722L935.646,289.18ZM24.513,289.001L24.354,289.18L24.007,287.722L24.504,287.573Z"},{"n":"Falkland Islands","d":"M344.042,393.603L346.212,391.893L348.31,392.606L349.325,391.465L351.467,392.749L351.08,393.745L348.33,394.598L347.041,393.603L345.533,394.882Z"},{"n":"France","d":"M502.393,114.564L501.697,116.837L500.62,116.247L499.993,114.24L500.449,113.149L501.904,112.03ZM488.047,90.595L490.785,91.714L493.299,93.295L495.033,93.986L497.218,96.498L496.391,99.047L495.448,99.511L493.812,102.479L495.717,103.295L496.371,105.223L496.253,108.386L497.298,110.03L490.617,110.883L486.993,113.621L481.635,112.648L476.501,111.971L476.797,109.061L474.905,100.18L469.792,97.597L472.538,94.851L475.658,92.317L483.008,91.312L485.6,88.392L486.977,89.45Z"},{"n":"Gabon","d":"M508.415,251.806L504.123,246.348L502.641,242.314L503.821,239.199L505.204,236.826L508.916,233.296L511.686,233.504L513.531,233.267L514.049,236.114L516.613,236.441L516.718,241.631L516.66,245.932L513.606,247.208L512.043,247.089L509.426,248.217Z"},{"n":"United Kingdom","d":"M467.644,78.77L466.404,80.68L464.779,80.117L463.42,80.146L463.916,78.63L463.538,77.147L465.369,77.035ZM473.615,67.447L473.464,70.051L475.23,72.311L475.479,74.973L477.578,78.574L480.396,82.202L483.711,83.871L482.333,86.511L481.23,89.478L474.422,90.251L471.878,91.025L468.202,91.8L470.387,88.221L472.383,87.593L468.303,85.999L469.469,83.587L473.203,82.005L473.536,80.342L472.079,78.574L468.948,77.342L469.067,75.334L467.832,73.945L467.644,69.694L471.064,67.693Z"},{"n":"Georgia","d":"M577.6,116.365L576.859,113.09L574.001,111.677L573.25,110.442L578.784,111.412L582.703,113.385L586.329,113.532L588.831,115.42L589.737,117.428L588.167,117.606L585.774,117.222L580.095,116.247Z"},{"n":"Ghana","d":"M482.714,222.408L477.285,225.167L472.675,225.197L471.707,221.458L473.456,215.611L472.448,209.137L476.94,207.324L478.878,207.057L479.872,208.216L480.945,211.899L481.815,215.343L481.458,219.499Z"},{"n":"Guinea","d":"M458.418,217.184L457.159,218.312L455.96,217.659L455.059,214.66L453.855,215.046L453.197,214.126L452.877,212.493L451.62,210.176L448.986,210.741L447.831,211.453L446.15,213.592L444.086,210.651L442.796,209.701L442.157,207.711L442.565,205.779L444.024,205.334L444.997,204.947L445.065,203.64L446.351,202.659L448.735,203.342L450.315,203.224L450.814,204.145L451.888,203.759L453.025,204.62L454.812,204.204L456.246,203.402L457.309,204.115L458.642,206.195L458.017,207.919L458.884,207.978L459.51,209.701L458.787,210.948L459.991,214.542L458.786,215.314L458.827,217.184Z"},{"n":"Gambia","d":"M437.167,200.964L437.521,199.656L440.294,199.567L440.865,198.853L441.679,198.794L442.658,199.537L443.446,199.537L444.292,199.061L444.813,199.894L443.684,200.578L442.592,200.518L441.508,199.894L440.556,200.578L440.098,200.608L439.48,201.024Z"},{"n":"Guinea Bissau","d":"M441.424,207.235L438.997,205.809L438.457,204.502L437.535,203.253L439.731,202.837L445.13,202.629L444.781,203.967L444.584,205.334L443.354,205.839Z"},{"n":"Equatorial Guinea","d":"M504.332,237.004L503.87,236.559L504.738,233.237L508.916,233.296L508.947,236.856L505.204,236.826Z"},{"n":"Greece","d":"M537.048,133.672L538.447,134.686L540.316,134.536L542.115,134.745L542.106,135.252L543.38,134.894L543.137,135.789L539.679,136.027L539.692,135.55L536.683,134.954ZM542.477,116.306L541.416,118.493L538.718,118.109L537.707,120.565L535.216,121.039L533.466,120.151L535.424,123.322L536.012,125.341L537.426,127.867L535.978,128.611L535.573,131.557L531.935,130.307L530.317,125.935L527.964,122.877L528.749,120.595L529.544,119.203L531.044,118.168L533.187,117.576L533.959,116.956L537.516,116.247L541.391,116.985Z"},{"n":"Greenland","d":"M401.877,9.191L413.917,8.187L422.333,7.357L445.22,9.006L435.468,9.809L427.052,10.343L437.972,10.787L442.626,10.904L444.975,11.315L458.372,10.923L451.967,13.202L445.312,14.027L446.972,15.669L444.888,19.515L443.941,21.091L443.985,23.012L442.079,25.197L440.002,27.415L441.241,29.23L435.929,29.59L437.835,32.327L433.196,31.962L437.869,34.065L434.758,36.536L431.358,34.163L429.225,37.132L436.909,37.381L425.679,41.551L417.595,42.438L411.986,46.117L405.867,48.025L399.996,49.269L397.339,52.715L391.95,56.567L390.719,60.865L385.98,63.641L379.33,61.43L377.145,57.364L374.175,52.347L372.75,47.612L373.146,44.809L379.463,40.893L381.739,37.88L378.006,39.132L374.067,38.68L375.868,35.668L381.325,36.287L377.274,33.869L373.894,33.623L376.182,30.434L374.344,26.255L372.922,24.356L364.974,22.828L355.538,23.104L351.628,20.932L360.474,20.097L349.767,18.625L358.033,16.721L366.373,14.906L364.349,13.325L373.996,11.71L378.368,10.324L388.968,9.999L395.565,9.546L401.386,10.401L401.127,9.999Z"},{"n":"Guatemala","d":"M250.999,199.21L248.184,198.645L245.835,196.831L246.361,195.284L247.57,192.278L251.009,191.266L250.427,190.433L248.764,188.766L250.121,187.068L254.816,187.098L253.892,192.814L255.428,193.35L256.373,193.29L253.823,195.254L253.699,196.414L252.482,197.366L252.081,198.05Z"},{"n":"French Guiana","d":"M345.269,232.584L343.051,233.919L342.138,232.94L340.239,233.148L341.141,230.537L340.626,227.511L341.852,222.912L344.593,223.951L347.643,227.66Z"},{"n":"Guyana","d":"M327.265,215.165L330.425,218.193L331.395,219.796L333.702,222.289L331.671,225.731L331.292,227.956L333.202,230.122L335.049,234.364L332.999,234.216L331.015,235.521L329.908,236.233L327.073,234.69L326.284,231.813L327.443,228.253L326.019,226.443L325.81,224.455L322.796,222.319L323.504,220.123L325.738,219.113L325.177,216.917Z"},{"n":"Honduras","d":"M257.852,201.47L256.767,200.28L256.736,198.764L255.098,198.883L254.32,198.02L253.11,197.188L253.556,195.849L255.106,194.421L256.638,193.409L257.969,192.844L258.592,192.933L260.926,193.141L262.117,192.457L263.496,192.814L264.698,192.487L266.191,192.963L267.58,194.213L269.024,195.462L267.77,195.819L266.209,196.206L265.119,196.444L264.47,196.087L263.817,196.771L262.762,198.199L261.956,198.913L260.64,199.121L259.491,199.18L259.045,200.667Z"},{"n":"Croatia","d":"M523.286,103.529L524.73,105.486L522.828,105.954L519.219,105.515L517.695,106.188L516.412,106.715L518.203,109.002L520.27,110.736L523.37,113.09L520.878,112.501L517.28,110.559L515.646,108.181L514.401,105.954L512.254,106.774L511.519,104.785L513.202,104.814L514.423,104.814L515.251,104.054L516.189,102.566L518.707,102.158L522.469,103.967Z"},{"n":"Haiti","d":"M295.814,180.811L299.466,181.437L299.183,184.179L299.057,185.579L297.306,185.907L294.583,185.877L292.073,185.519L294.684,184.953L297.555,184.536L296.693,182.123Z"},{"n":"Hungary","d":"M517.054,100.79L517.198,98.293L518.566,97.105L520.647,98.148L522.664,97.221L524.615,96.671L525.916,96.498L527.108,95.659L530.087,96.237L531.65,97.8L529.436,100.383L526.428,102.887L523.286,103.529L520.519,103.412L517.949,101.809Z"},{"n":"Indonesia","d":"M788.037,270.388L786.959,270.448L783.762,268.368L786.191,267.774L787.46,268.695L788.268,269.586ZM797.559,270.091L795.298,270.745L795.028,270.388L795.359,269.378L796.629,267.567L799.266,266.379L799.468,266.973L799.436,267.864ZM781.392,264.033L782.252,264.805L783.856,264.568L784.391,265.844L781.378,266.438L779.582,266.824L778.205,266.795L779.213,265.102L780.621,265.072ZM794.176,264.004L793.681,265.666L789.752,266.498L786.385,266.141L786.476,265.043L788.568,264.449L790.08,265.34L791.812,265.102ZM757.923,260.115L763.452,259.195L768.922,262.519L775.732,264.835L769.986,264.775L765.039,264.627L759.814,262.964L756.867,263.054L751.911,260.53L751.487,257.503L756.588,258.839ZM824.822,258.423L823.373,260.471L823.275,258.215L823.804,257.147L824.401,256.168L824.938,257.028ZM806.104,250.264L805.094,251.243L803.346,250.709L802.903,249.433L805.496,249.285ZM814.393,249.166L815.233,251.45L813.127,250.234L811.009,249.967L809.541,250.175L807.777,250.056L808.444,248.424L811.6,248.306ZM823.93,243.411L827.153,249.997L832.366,245.043L836.805,246.081L841.428,247.712L840.225,267.062L835.663,264.033L831.694,264.954L834.685,261.718L833.194,255.99L826.248,253.23L821.721,251.925L820.191,251.124L818.314,248.365L822.931,247.356L818.977,246.555L815.714,244.242L818.123,242.076L823.557,242.314ZM801.1,235.788L797.155,239.288L790.41,238.873L787.793,241.542L791.476,242.848L796.036,243.203L793.789,244.509L793.829,249.463L795.503,253.883L793.977,256.702L794.38,253.23L791.214,253.557L789.816,250.679L788.367,248.691L788.36,256.405L785.67,255.96L786.24,250.353L784.43,248.306L785.925,244.004L787.792,238.309L791.962,237.004L798.144,237.271ZM809.957,236.648L809.847,239.229L808.513,238.932L808.129,240.742L809.172,242.314L808.451,242.67L807.437,240.801L806.653,237.004L807.132,234.631L807.957,233.563L808.167,235.165L809.684,235.432ZM782.212,234.572L782.07,237.686L781.326,242.373L778.712,247.356L777.254,250.857L773.349,250.382L770.282,249.255L766.294,248.869L762.505,248.691L760.928,243.886L759.359,238.754L761.129,234.038L763.353,237.716L766.658,237.33L769.356,235.551L773.872,235.758L776.07,230.597L779.796,227.215L780.652,230.419ZM750.906,257.355L746.022,254.951L741.793,250.709L738.669,246.081L734.514,239.466L732.784,234.601L729.055,230.181L724.287,225.256L725.665,223.862L732.02,227.333L735.498,230.597L740.616,233.83L744.306,238.339L745.226,242.106L747.603,243.203L748.883,246.941L751.961,249.077Z"},{"n":"India","d":"M667.525,134.328L671.23,140.234L672.808,143.309L672.346,146.176L678.977,150.179L677.294,154.332L682.497,156.902L689.521,158.993L693.181,160.786L698.364,161.443L697.703,158.336L699.018,156.424L699.892,159.382L703.812,160.039L707.947,160.158L706.553,157.38L710.207,154.78L714.844,153.615L717.913,154.213L720.13,155.916L719.817,157.589L718.549,158.904L716.222,162.668L715.487,166.61L712.784,168.401L712.847,172.52L712.205,174.489L709.39,169.774L707.68,170.132L709.24,168.252L708.373,165.206L703.63,164.848L701.819,162.638L699.099,163.355L699.844,166.042L701.157,167.953L702.299,171.983L702.899,175.533L698.197,176.1L697.585,180.125L691.869,185.638L687.9,189.45L686.868,191.564L683.527,192.784L683.889,198.913L683.389,204.204L682.435,209.404L682.253,212.641L679.218,215.521L675.666,213.592L673.08,206.433L670.504,202.183L668.976,196.593L664.677,186.741L663.077,179.321L658.832,178.307L653.277,174.34L653.467,172.102L651.586,167.565L656.2,164.997L653.965,161.204L654.365,156.723L659.296,153.824L662.109,147.789L663.392,143.936L659.845,140.443L659.343,136.534L665.765,136.832Z"},{"n":"Ireland","d":"M466.404,80.68L466.714,82.711L464.955,85.232L460.962,86.909L457.825,86.482L459.758,83.531L458.752,80.652L461.828,78.462L463.538,77.147L463.916,78.63L463.42,80.146L464.779,80.117Z"},{"n":"Iran","d":"M609.041,129.235L612.439,126.975L614.998,126.5L619.679,128.283L624.884,131.23L627.372,133.851L626.787,139.726L627.168,141.816L628.85,146.086L631.293,148.506L630.953,152.808L634.766,155.916L636.452,159.023L633.488,161.951L628.233,164.519L622.583,163.444L619.806,159.262L615.665,161.234L609.725,157.948L605.257,154.272L601.699,150.747L599.242,150.926L597.454,147.759L596.816,145.608L592.075,141.696L590.278,136.534L590.932,133.762L587.156,129.325L585.84,126.024L586.076,121.78L588.051,124.272L590.593,124.569L593.885,122.166L594.15,124.51L596.448,125.905L599.937,128.73L605.316,130.723Z"},{"n":"Iraq","d":"M589.218,132.868L591.346,135.52L590.031,138.861L595.255,143.338L596.699,147.789L597.678,149.372L597.751,150.777L594.617,153.406L582.438,147.162L575.557,144.264L579.188,137.518L579.142,131.736L581.34,129.146L585.132,129.057L587.156,129.325Z"},{"n":"Iceland","d":"M451.089,46.683L452.572,50.127L443.714,53.924L439.254,54.029L435.839,52.033L435.283,50.257L431.168,48.88L435.887,46.812L441.964,47.147L447.801,46.503Z"},{"n":"Israel","d":"M566.913,142.622L565.651,143.159L565.995,145.489L565.374,146.684L566.641,147.43L563.796,147.072L564.228,145.907L565.029,142.264L565.366,141.487L566.336,140.98L567.157,142.144Z"},{"n":"Italy","d":"M516.987,126.173L516.246,128.521L516.65,129.444L516.22,130.962L514.346,129.831L513.111,129.533L509.698,128.016L509.969,126.47L512.772,126.767L515.189,126.44ZM501.667,117.34L503.152,119.44L502.954,123.352L501.856,123.174L500.936,124.153L500.011,123.382L499.812,119.795L499.219,118.109L500.519,118.256ZM508.329,101.023L511.475,103.208L510.233,104.025L508.61,106.51L509.214,108.856L512.768,112.766L517.346,115.125L517.325,116.365L521.278,118.316L523.678,120.417L521.909,120.091L518.943,121.513L520.52,124.183L518.407,126.886L517.396,126.232L518.276,124.005L516.441,120.773L514.678,119.144L512.068,117.399L508.425,115.892L504.526,112.265L502.513,109.002L499.547,108.445L497.298,110.03L496.253,108.386L496.371,105.223L495.717,103.295L497.847,103.792L499.506,103.237L501.044,101.984L503.743,101.867L505.288,101.081L507.749,100.005Z"},{"n":"Jamaica","d":"M284.275,185.072L285.935,185.341L287.191,186.055L287.531,186.86L285.756,186.919L284.917,187.426L283.555,186.949L282.242,185.847L282.621,185.192L283.705,184.983Z"},{"n":"Jordan","d":"M566.593,143.577L569.734,143.816L575.557,144.264L570.387,146.206L572.365,149.701L570.215,151.105L568.748,153.107L565.842,152.211L566.484,146.265Z"},{"n":"Japan","d":"M805.96,138.324L806.67,139.338L805.983,141.159L804.626,140.204L803.648,140.89L803.647,142.652L801.747,141.786L801.248,140.383L801.9,138.592L803.419,138.95L803.924,137.697ZM817.473,129.414L818.681,133.285L815.836,136.773L809.548,140.383L806.495,136.981L800.242,139.07L800.695,141.308L799.753,147.639L797.824,143.786L794.239,140.86L796.767,138.085L799.567,134.507L806.818,134.209L809.284,130.336L812.304,126.203L810.04,119.262L812.319,116.837L816.782,123.352ZM813.793,108.621L815.769,109.237L816.708,108.005L819.094,111.294L816.086,112.089L815.608,115.007L810.863,113.002L811.309,116.247L808.717,116.276L806.867,113.355L806.797,111.088L809.193,110.912L807.603,106.862L806.978,104.58L811.44,107.624Z"},{"n":"Kazakhstan","d":"M646.117,114.21L642.363,116.837L640.984,118.966L636.966,117.458L634.756,115.036L630.863,109.913L624.308,110.589L619.294,106.833L614.706,104.463L611.611,117.044L608.331,114.889L604.02,114.653L602.924,114.918L602.598,112.678L598.12,109.032L596.433,107.331L598.382,105.457L602.343,105.428L601.316,100.79L596.957,100.209L592.577,102.1L591.227,100.121L587.717,98.264L586.213,94.13L586.544,90.395L589.015,89.936L596.347,86.767L604.722,89.908L610.283,88.649L613.967,89.278L617.317,88.05L614.848,84.692L616.091,83.191L614.612,80.286L623.316,78.63L629.933,76.421L635.828,79.949L641.025,80.202L643.455,81.582L647.485,79.808L658.899,89.221L663.224,89.364L667.582,89.135L671.103,91.341L675.277,92.173L676.212,95.862L675.421,99.047L669.756,99.395L668.969,105.252L668.493,111.53L667.817,113.974L664.746,112.472L657.305,112.089L652.869,111.177L651.852,113.532L646.315,112.943Z"},{"n":"Kenya","d":"M585.1,242.551L584.8,246.17L583.2,247.623L581.988,250.916L580.412,253.883L576.624,249.196L566.92,242.818L567.641,238.458L569.832,234.335L568.359,229.44L568.673,225.613L571.726,224.159L572.634,226.799L577.686,229.321L579.094,229.262L581.382,229.855L584.452,227.363L587.258,228.372Z"},{"n":"Kyrgyzstan","d":"M646.117,114.21L647.713,112.501L651.739,111.794L656.558,112.413L661.204,112.177L666.233,113.532L667.693,114.653L663.961,117.399L660.673,119.647L656.589,119.825L655.197,121.928L650.312,123.055L644.63,122.314L647.153,121.099L649.646,120.476L648.937,116.808L645.43,116.424Z"},{"n":"Cambodia","d":"M743.997,208.453L741.214,203.818L741.594,197.753L747.244,197.634L750.384,196.741L753.576,199.805L749.625,205.661L748.263,207.681Z"},{"n":"South Korea","d":"M785.401,125.044L790.339,130.485L791.467,135.55L788.042,137.339L785.073,135.997L782.392,130.634L781.281,127.6L782.437,127.451L784.437,125.965Z"},{"n":"Kosovo","d":"M528.649,114.859L528.294,115.42L527.464,114.063L527.307,112.619L528.099,111.412L528.866,111.677L529.641,112.324L530.537,113.002L530.665,113.709L530.523,114.269Z"},{"n":"Kuwait","d":"M597.751,150.777L598.428,152.121L598.284,152.778L599.361,155.049L597.618,155.109L596.842,153.705L594.617,153.406L596.078,150.537Z"},{"n":"Laos","d":"M747.244,197.634L747.691,193.766L744.712,188.23L740.477,185.609L738.654,186.741L735.426,187.991L735.098,182.182L732.946,180.245L732.053,178.217L734.203,176.995L734.552,173.654L737.66,175.563L742.395,178.307L742.324,181.705L745.078,184.536L749.726,190.701L752.833,194.867L750.384,196.741Z"},{"n":"Lebanon","d":"M566.986,140.92L566.336,140.98L566.168,141.487L565.366,141.487L565.97,139.04L566.962,136.952L567.001,136.862L568.105,137.011L568.616,138.175L567.427,139.309Z"},{"n":"Liberia","d":"M460.248,227.066L456.948,225.672L452.433,221.785L451.349,218.906L452.644,216.442L454.392,214.987L456.121,216.471L456.443,218.312L457.702,217.125L458.286,218.045L457.991,220.805L459.548,221.814L460.692,224.248Z"},{"n":"Libya","d":"M517.143,172.042L513.953,171.505L508.832,168.341L505.672,167.505L504.64,164.549L504.096,161.144L504.118,157.619L504.277,153.824L503.247,149.791L504.619,147.849L505.971,145.459L507.843,143.637L510.796,142.383L513.87,142.622L518.394,146.594L524.126,148.446L527.957,149.133L528.38,145.489L530.732,142.622L535.733,142.831L537.548,144.175L540.799,145.041L540.665,147.46L540.619,150.597L542.11,163.623L542.904,180.573L540.033,181.825L519.62,170.401Z"},{"n":"Sri Lanka","d":"M689.171,217.689L688.928,220.776L687.888,221.606L685.688,222.289L684.363,219.944L683.725,215.67L684.596,210.859L686.459,212.493L687.756,214.601Z"},{"n":"Lesotho","d":"M551.354,326.176L552.152,327.072L551.287,328.506L550.798,329.492L549.39,329.97L548.88,330.927L547.976,331.225L546.297,328.925L547.728,327.012L549.136,325.847L550.334,325.25Z"},{"n":"Lithuania","d":"M529.695,79.387L529.584,77.902L526.235,76.979L527.875,73.778L533.601,73.695L535.149,74.445L537.807,77.035L535.857,79.527L531.477,80.568Z"},{"n":"Luxembourg","d":"M493.56,91.312L494.028,91.972L493.951,93.237L493.299,93.295L492.774,93.036L492.979,91.427Z"},{"n":"Latvia","d":"M525.515,74.639L526.187,70.821L530.054,71.924L531.888,69.776L534.618,69.611L538.383,70.656L539.905,72.615L538.67,75.334L535.149,74.445L533.601,73.695L527.875,73.778Z"},{"n":"Morocco","d":"M467.51,133.523L471.228,134.596L474.766,135.282L475.808,139.01L477.274,142.801L473.612,144.473L471.087,145.817L468.089,149.223L465.113,151.523L458.645,154.183L458.203,157.708L458.245,159.322L455.876,160.099L453.879,159.71L450.914,162.369L448.874,166.341L444.389,173.684L442.998,176.1L437.297,176.339L438.441,174.131L439.17,171.565L441.54,167.565L443.127,165.355L444.178,161.921L447.525,157.768L448.845,156.573L453.152,154.213L456.53,150.926L457.004,144.623L458.967,141.04L463.269,138.443L465.729,133.523Z"},{"n":"Moldova","d":"M540.427,96.816L542.381,96.093L545.117,97.105L546.205,98.873L547.582,100.558L548.37,101.721L548.252,102.246L546.609,101.751L546.381,102.508L545.599,104.434L544.471,103.441L544.355,100.907L541.947,97.945Z"},{"n":"Madagascar","d":"M606.11,277.014L607.264,280.255L608.04,285.222L607.185,287.513L605.897,286.65L605.922,290.133L604.865,293.319L602.04,300.918L598.683,310.703L595.123,314.883L591.469,315.391L589.047,312.733L588.447,307.719L588.984,303.423L590.279,301.902L591.988,297.758L591.153,294.451L592.113,290.043L593.827,288.049L596.251,286.888L598.912,285.162L601.968,281.831L602.729,280.909L604.376,277.074Z"},{"n":"Mexico","d":"M238.782,163.056L236.426,167.834L234.978,173.296L235.643,176.368L237.064,180.901L238.172,184.059L241.588,186.115L245.884,184.983L249.515,183.911L252.155,180.96L253.291,177.591L257.885,176.13L261.646,175.981L261.838,178.038L259.387,181.616L259.212,183.434L257.743,184.983L256.722,185.072L255.167,186.532L254.816,187.098L250.121,187.068L248.764,188.766L250.427,190.433L251.009,191.266L247.57,192.278L246.361,195.284L245.835,196.831L242.127,192.665L238.726,192.1L235.23,193.528L231.727,192.159L227.682,190.373L223.093,187.574L221.192,186.592L217.911,184.298L214.545,180.722L215.072,178.993L215.692,177.353L215.3,174.996L214.742,172.311L211.128,166.998L208.485,163.922L209.014,161.353L206.813,159.202L205.451,156.872L203.661,153.854L203.122,150.657L203.285,147.221L201.008,146.176L199.106,146.564L198.677,150.239L200.402,153.525L200.937,154.452L201.444,155.408L201.973,158.097L203.398,160.696L203.984,164.788L204.136,167.744L206.037,169.207L206.495,171.058L204.766,172.162L203.216,168.64L200.644,166.43L201.237,162.638L198.92,160.367L198.053,159.979L195.695,157.529L196.922,157.469L198.598,154.99L196.074,152.031L195.381,148.207L194.839,143.129L200.876,142.592L203.702,144.623L213.506,146.713L215.789,145.489L220.62,146.534L222.687,148.805L223.265,152.002L226.131,153.794L230.305,151.374L232.461,154.601L233.97,158.067L234.433,161.562L237.795,163.145Z"},{"n":"Macedonia","d":"M528.294,115.42L528.649,114.859L530.523,114.269L532.379,114.063L533.959,116.956L533.187,117.576L531.044,118.168L528.512,117.695Z"},{"n":"Mali","d":"M449.105,196.593L450.406,194.302L452.983,195.076L455.397,194.689L465.954,193.975L466.098,191.505L463.947,165.774L476.123,172.251L485.182,180.155L487.931,181.497L490.761,183.076L489.422,191.951L486.973,194.242L482.588,195.552L479.315,195.7L477.285,195.552L474.438,197.693L472.119,199.805L469.805,200.013L468.724,202.778L466.747,206.225L466.223,209.226L464.56,210.028L463.442,209.107L462.519,209.909L459.843,209.434L458.724,208.869L458.555,207.622L458.126,206.938L457.607,204.947L456.754,203.461L455.631,203.818L454.092,204.858L452.32,203.848L451.222,204.145L450.699,203.075L450.622,200.994L449.205,198.467Z"},{"n":"Malta","d":"M515.053,133.255L514.961,133.344L514.744,133.344L514.521,133.195L514.506,132.868L514.75,132.927L514.975,133.136ZM514.404,132.719L514.262,132.778L514.114,132.689L514.087,132.629L514.277,132.57L514.376,132.629L514.426,132.689Z"},{"n":"Myanmar","d":"M730.366,180.006L727.35,181.437L725.727,185.192L729.204,189.986L729.913,194.54L729.878,196.593L732.306,200.608L733.686,204.71L731.54,210.533L731.696,206.047L730.573,201.053L728.152,195.938L725.803,189.718L721.731,193.35L718.622,192.368L718.106,185.907L715.785,181.377L712.112,178.575L712.508,176.637L713.337,173.773L713.245,171.505L714.857,169.088L715.333,165.176L715.771,160.965L720.424,159.441L720.561,157.051L721.506,155.677L723.973,158.157L724.986,162.906L723.538,168.938L727.215,171.207L728.625,174.25L731.881,175.921L733.851,176.279L731.711,179.321Z"},{"n":"Montenegro","d":"M526.301,113.532L525.196,114.417L524.919,115.125L523.148,113.591L523.605,111.471L524.724,110.53L525.747,111.441L527.473,112.354L526.912,113.267Z"},{"n":"Mongolia","d":"M677.961,93.698L683.397,90.738L688.544,90.251L693.019,91.656L698.863,92.461L698.463,88.792L702.414,87.023L707.582,88.078L712.813,91.427L717.321,90.509L722.653,92.288L726.817,93.727L731.603,93.468L736.55,90.968L739.763,92.231L742.379,94.188L743.45,98.235L747.045,98.322L750.544,98.177L753.931,101.256L748.832,101.314L746.89,104.054L742.315,106.745L738.255,105.896L739.143,108.914L738.733,110.853L735.427,113.473L728.613,114.623L725.094,115.272L718.112,113.503L712.699,113.473L705.062,112.854L700.99,108.415L695.934,106.247L689.755,105.34L688.027,100.674L681.858,97.25Z"},{"n":"Mozambique","d":"M568.071,274.191L573.02,274.785L575.481,274.339L577.957,273.507L582.875,270.626L583.028,274.904L583.128,282.158L582.649,285.758L579.837,289.656L574.54,292.247L570.526,295.97L567.574,298.772L568.298,303.154L568.658,305.809L568.826,308.584L568.896,310.494L567.313,312.793L562.077,315.421L561.043,317.78L561.338,319.543L559.351,318.199L558.92,315.779L559.069,310.345L560.94,302.767L562.13,300.322L562.142,297.699L562.961,293.408L561.861,288.674L560.153,287.722L556.882,287.156L556.597,283.943L565.801,282.902L567.483,283.378L566.994,285.966L568.64,289.895L570.639,287.216L569.626,281.236L567.857,280.314Z"},{"n":"Mauritania","d":"M449.105,196.593L445.951,192.368L443.095,190.701L440.448,191.385L438.306,192.07L438.855,189.004L439.018,183.255L439.044,180.304L437.159,177.591L447.552,176.607L447.84,170.789L450.281,162.877L458.533,158.485L463.947,165.774L466.098,191.505L465.954,193.975L455.397,194.689L452.983,195.076L450.406,194.302Z"},{"n":"Malawi","d":"M568.071,274.191L567.857,280.314L569.626,281.236L570.639,287.216L568.64,289.895L566.994,285.966L567.483,283.378L565.801,282.902L563.089,280.701L564.798,276.925L564.975,272.052L564.836,268.725L566.158,267.953L567.478,270.15Z"},{"n":"Malaysia","d":"M738.721,221.606L740.646,222.764L742.033,221.814L744.789,225.583L744.78,228.935L745.291,231.724L747.277,235.165L745.419,236.352L739.885,231.813L738.022,228.312L736.59,224.248L736.148,220.835ZM783.874,226.71L779.796,227.215L776.07,230.597L773.872,235.758L769.356,235.551L766.658,237.33L763.353,237.716L761.129,234.038L765.008,234.512L766.558,231.427L771.362,228.461L773.784,228.105L775.516,227.185L775.621,223.832L778.647,219.47L781.068,220.954L783.006,223.061L785.057,225.108Z"},{"n":"Namibia","d":"M520.277,325.04L517.648,320.589L516.647,315.511L516.009,307.361L514.78,304.497L512.303,298.444L509.77,293.676L510.906,290.818L514.05,290.401L515.925,291.532L527.898,292.842L538.687,292.038L542.394,291.532L543.373,292.455L541.176,293.14L538.602,293.081L532.782,294.213L529.884,304.944L529.044,324.682L525.44,326.445L522.84,325.638L521.519,323.546Z"},{"n":"New Caledonia","d":"M896.235,302.647L897.755,304.497L898.648,305.869L897.478,306.585L896.345,305.779L894.939,304.437L893.79,302.856L892.723,300.739L892.638,299.755L893.711,299.785L894.844,300.799L895.667,301.812Z"},{"n":"Niger","d":"M485.476,204.561L482.595,201.856L481.093,198.467L480.939,195.671L483.525,194.51L489.228,193.766L490.804,189.957L494.303,181.765L509.973,170.222L515.396,173.147L517.895,176.667L518.919,178.396L519.482,180.692L518.599,190.612L514.385,197.336L515.473,200.37L516.894,201.826L516.096,202.956L513.862,199.745L511.29,201.291L507.945,200.251L505.711,200.578L502.926,201.916L498.645,201.113L496.399,199.953L491.107,199.18L490.1,201.529L489.198,205.393L486.34,203.699Z"},{"n":"Nigeria","d":"M501.772,225.85L498.137,226.77L495.116,227.363L492.879,223.357L489.137,221.428L487.031,216.65L487.433,212.879L489.468,210.147L489.692,208.156L489.198,205.393L490.1,201.529L491.107,199.18L496.399,199.953L498.645,201.113L502.926,201.916L505.711,200.578L507.945,200.251L511.29,201.291L513.862,199.745L516.096,202.956L516.859,204.68L514.607,207.948L513.624,211.394L512.577,214.126L510.836,216.857L510.061,219.292L506.861,219.054L504.363,220.865L502.431,223.743Z"},{"n":"Nicaragua","d":"M261.482,207.087L259.562,204.947L258.096,203.015L257.263,201.232L257.852,201.47L259.045,200.667L259.491,199.18L260.64,199.121L261.956,198.913L262.762,198.199L263.817,196.771L264.47,196.087L265.119,196.444L266.209,196.206L267.77,195.819L269.024,195.462L268.599,196.414L268.066,198.526L267.482,201.024L267.505,203.134L266.739,204.71L266.262,206.255L266.676,207.532L265.292,207.978L264.131,207.116L261.894,206.7Z"},{"n":"Netherlands","d":"M493.343,81.694L495.192,81.779L495.622,82.739L495.159,85.317L494.64,86.397L493.307,86.397L493.773,89.393L492.525,88.707L491.066,87.451L489.03,88.05L487.376,87.822L488.521,87.052L490.381,82.88Z"},{"n":"Norway","d":"M533.774,34.754L537.828,37.232L537.192,39.81L536.138,38.28L530.616,38.13L528.35,41.096L523.624,40.616L520.189,39.936L518.936,41.703L514.85,42.717L511.865,44.527L507.405,51.013L507.594,52.951L504.443,55.375L506.258,60.275L504.188,65.295L501.841,65.187L495.016,68.98L491.179,64.671L492.159,56.753L501.335,51.797L509.064,43.226L517.086,38.155L524.354,37.207L530.433,35.248ZM524.018,19.047L520.238,19.963L516.987,19.425L518.102,18.847L516.881,18.162L520.453,17.722L521.342,18.537ZM511.771,15.032L513.602,17.482L511.399,19.515L508.682,21.477L506.156,19.292L499.737,16.808L502.836,14.381L506.367,15.096L509.444,14.298ZM523.897,13.551L527.496,14.277L525.227,15.413L520.228,15.669L515.015,15.307L514.581,14.737L512.071,14.695L509.996,13.737L515.2,13.161L517.816,13.654L519.4,13.039Z"},{"n":"Nepal","d":"M697.641,157.051L698.404,160.248L696.311,161.473L691.216,160.487L686.033,158.605L679.898,155.438L677.703,151.523L679.859,149.462L684.895,152.33L687.463,154.183L691.769,156.095Z"},{"n":"New Zealand","d":"M887.572,361.803L889.768,361.832L888.874,364.315L884.154,367.852L882.093,370.44L877.532,371.585L872.221,376.471L867.742,378.599L864.869,377.579L862.894,376.296L870.463,371.232L874.735,369.588L880.158,366.497L883.962,363.547L887.84,360.53ZM899.583,347.668L900.781,348.77L900.498,351.835L903.346,353.025L906.374,352.252L902.467,356.618L899.518,357.449L898.27,359.287L893.918,362.897L891.443,363.31L893.63,360.442L892.014,357.627L895.047,355.52L897.79,351.3L898.286,348.77L897.285,344.927L898.401,342.571L900.325,345.016Z"},{"n":"Oman","d":"M627.775,177.263L625.876,179.142L625.179,181.348L625.446,183.732L622.818,184.834L622.157,186.889L619.665,187.634L618.607,189.659L615.573,190.373L613.435,188.468L618.389,180.573L618.139,172.49L618.685,170.073L619.609,168.252L619.118,165.893L621.742,167.923L625.126,169.386L627.979,171.655L629.708,173.027L629.045,175.474ZM620.017,162.966L619.762,163.534L619.165,162.488L619.76,161.473L620.116,161.742Z"},{"n":"Pakistan","d":"M659.923,129.444L663.265,133.106L665.765,136.832L659.343,136.534L659.845,140.443L663.392,143.936L662.109,147.789L659.296,153.824L654.365,156.723L653.965,161.204L656.2,164.997L651.586,167.565L648.265,168.819L644.995,164.37L636.476,164.997L633.488,161.951L636.452,159.023L634.766,155.916L630.953,152.808L633.846,152.749L637.772,152.689L639.923,152.3L642.558,148.506L645.446,146.833L647.375,145.608L649.125,145.041L649.336,141.428L649.378,138.712L652.153,137.727L652.735,135.341L651.295,132.6L654.844,130.664L658.612,129.771Z"},{"n":"Panama","d":"M280.788,218.579L279.499,216.115L279.526,215.106L277.888,213.295L276.183,214.542L274.553,215.373L275.411,217.6L274.298,218.431L272.74,216.798L271.548,217.125L270.061,215.729L268.315,215.403L267.922,215.581L268.346,214.393L268.679,213.502L268.242,211.869L270.083,212.671L271.007,213.443L271.925,213.918L274.33,212.968L276.846,211.483L278.119,211.958L280.638,212.552L282.355,214.274L282.525,216.442L281.188,217.125Z"},{"n":"Peru","d":"M304.134,292.217L302.398,294.51L299.342,291.562L289.168,285.341L285.789,281.028L283.65,276.271L277.992,264.894L275.975,261.332L272.028,258.215L271.472,254.061L274.211,250.086L273.822,252.044L274.973,252.904L277.127,254.714L278.984,251.48L283.548,247.742L287.109,242.699L287.409,240.178L289.956,242.966L292.686,246.852L296.013,246.437L298.478,246.704L298.859,251.094L300.947,252.756L298.29,253.052L293.341,255.634L292.577,258.067L291.392,260.53L290.777,262.311L293.475,266.795L294.728,268.25L298.039,269.913L300.118,272.676L302.708,272.497L304.748,278.292L304.92,282.902L304.602,285.49L305.42,289.001Z"},{"n":"Philippines","d":"M802.993,215.046L803.688,218.668L801.85,218.371L801.713,222.052L797.956,221.725L797.768,218.164L795.351,217.985L792.364,219.529L792.682,216.175L795.536,214.215L798.419,214.75L800.516,213.324L802.35,212.433ZM796.343,209.493L795.523,210.473L794.91,212.344L794.199,213.235L792.427,211.186L792.885,210.384L793.44,209.552L793.529,207.711L794.912,207.532L794.713,209.523L796.296,206.671ZM782.626,212.344L779.464,215.165L780.545,213.087L782.249,211.275L783.582,209.196L784.601,206.255L785.317,208.691L783.793,210.325ZM790.466,204.71L792.101,205.631L793.731,205.631L793.818,206.849L792.783,208.127L791.243,209.018L791.02,207.622L791.033,206.106ZM799.59,203.907L800.69,207.206L798.64,206.433L798.8,207.414L799.636,209.255L798.481,209.939L798.157,207.829L797.376,207.681L796.766,205.869L798.297,206.106L798.143,205.007L796.311,202.718L798.762,202.778ZM789.146,201.202L788.775,203.759L787.503,202.302L785.915,200.013L788.117,200.132ZM786.11,185.043L788.467,185.102L788.624,187.098L789.605,191.713L788.253,195.105L790.544,197.783L795.019,199.091L795.914,201.41L793.664,201.321L792,200.845L787.908,199.507L786.51,197.634L786.329,196.176L784.665,195.552L783.556,191.415L784.236,187.723Z"},{"n":"Papua New Guinea","d":"M878.835,260.234L878.094,260.53L877.088,259.403L876.108,257.503L875.698,255.248L876.076,254.951L876.3,255.841L877.022,256.524L878.14,258.394L879.263,259.403ZM869.154,256.257L867.34,257.325L864.522,258.75L861.13,257.889L859.995,256.138L863.694,256.346L864.532,254.833L866.162,256.198L868.442,254.12L869.795,252.311L870.139,254.447ZM856.459,261.925L859.9,267.002L861.143,268.22L862.219,269.289L864.383,271.398L862.133,270.834L857.456,270.061L854.433,266.527L850.131,262.638L846.256,264.479L844.246,267.685L840.225,267.062L841.428,247.712L850.465,251.45L853.514,254.477L857.945,258.037L856.062,259.937ZM872.302,253.349L871.462,254.15L871.071,252.4L870.538,251.243L869.403,250.264L867.991,249.018L866.176,248.128L866.917,247.416L868.274,248.246L869.123,248.899L870.172,249.611L871.145,250.857L872.074,251.806Z"},{"n":"Poland","d":"M513.52,88.507L512.585,85.715L511.034,83.191L510.987,80.99L515.725,78.882L520.614,78.406L522.954,79.106L529.695,79.387L531.477,80.568L532.458,82.88L531.333,84.579L532.361,87.166L533.606,90.481L530.751,93.18L530.957,94.303L527.119,93.612L524.757,93.929L522.625,93.295L521.319,91.714L519.345,90.652L517.516,91.054L516.334,89.679Z"},{"n":"Puerto Rico","d":"M312.768,185.013L314.031,185.251L314.427,185.847L313.699,186.592L311.805,186.592L310.331,186.681L310.304,185.43L310.702,184.983Z"},{"n":"North Korea","d":"M785.639,113.827L785.251,114.181L784.507,116.187L784.681,118.966L783.995,120.358L781.964,121.632L782.348,123.263L785.401,125.044L784.437,125.965L782.437,127.451L781.281,127.6L779.848,127.6L778.926,127.273L777.356,126.529L777.878,124.866L777.372,122.729L775.486,121.928L775.106,119.233L777.628,115.538L781.259,116.571L783.177,113.768Z"},{"n":"Portugal","d":"M458.822,115.361L460.664,114.181L462.591,115.626L464.357,115.361L463.878,117.635L463.385,120.388L462.232,122.017L462.446,125.757L462.882,127.451L462.164,129.533L459.927,129.89L459.097,127.897L457.872,125.787L457.589,122.729L458.775,120.447L459.318,117.428Z"},{"n":"Paraguay","d":"M322.988,306.137L323.475,300.948L328.741,297.46L333.573,299.04L334.599,301.604L337.549,306.227L340.278,306.466L341.356,310.077L342.718,311.36L344.57,311.42L344.596,314.824L344.212,319.184L340.351,321.963L334.915,320.678L336.263,314.824L330.255,311.45Z"},{"n":"Qatar","d":"M606.526,166.401L606.123,164.221L606.622,162.638L607.284,162.339L608.131,163.265L608.369,164.997L608.008,166.759L607.332,166.968Z"},{"n":"Romania","d":"M531.65,97.8L534.004,97.482L536.606,98.206L538.982,97.482L540.427,96.816L541.947,97.945L544.355,100.907L544.471,103.441L546.14,105.311L548.265,105.34L547.367,106.715L546.395,109.971L543.179,108.591L539.45,110.03L534.186,109.413L532.543,108.445L532.566,107.418L531.296,107.712L529.567,105.662L527.768,104.054L528.216,102.333L530.321,98.409Z"},{"n":"Russia","d":"M801.29,89.536L802.967,93.669L808.308,100.819L806.701,101.11L804.655,100.907L800.937,94.967L797.616,88.964L791.858,82.287L791.122,79.668L793.747,81.159L798.392,86.653ZM529.695,79.387L525.678,79.443L522.954,79.106L523.329,77.874L526.235,76.979L528.573,77.454L529.584,77.902L529.437,78.686ZM131.653,46.374L133.978,45.142L140.071,47.922L133.217,49.321L128.869,52.426L126.556,51.431L125.58,49.529L121.347,49.451L122.883,47.586L119.226,49.425L129.205,40.313L133.719,44.758ZM824.775,35.643L822.83,35.767L821.469,34.976L822.52,33.942ZM137.928,35.495L135.225,35.643L137.48,33.942L137.859,33.844L139.476,33.844L141.277,34.557L140.672,34.902ZM748.774,29.831L745.948,29.831L741.822,29.566L741.355,29.446L742.071,28.487L744.156,28.272L747.823,29.182ZM756.761,25.384L755.774,26.302L752.568,26.09L748.041,25.173L747.542,24.403L751.375,24.752ZM745.05,24.263L745.679,25.995L738.803,25.925L736.407,26.491L731.017,24.963L730.149,23.358L732.029,22.92L736.962,23.035ZM590.328,35.916L582.888,35.817L578.236,34.065L579.18,32.205L581.447,28.822L583.125,26.443L585.66,24.147L596.707,22.231L602.644,21.091L603.651,22.713L592.854,24.963L586.539,29.542L585.818,33.893ZM672.411,21.023L675.08,21.591L685.557,22.736L688.565,24.799L683.522,26.798L685.354,27.843L689.9,27.986L692.504,28.918L701.472,28.918L711.143,30.41L713.849,28.99L721.088,30.241L723.363,32.815L731.57,35.742L735.038,34.262L742.073,34.36L746.233,34.016L743.858,30.7L765.852,33.721L780.171,35.149L787.237,36.585L792.28,39.107L797.642,38.53L805.25,38.756L812.754,40.187L808.723,37.456L819.579,38.005L830.795,40.313L843.215,50.544L839.089,51.484L846.201,55.058L849.409,56.859L845.171,56.992L840.07,59.311L837.505,62.831L833.112,62.21L827.804,63.317L823.736,64.102L824.693,68.542L828.747,70.243L830.178,74.389L833.189,77.902L832.455,82.569L831.316,86.141L827.818,86.824L817.422,76.449L815.631,70.959L817.349,69.035L819.012,62.831L818.55,56.912L817.25,59.338L809.946,58.99L804.416,64.4L803.573,66.792L798.982,65.105L793.878,66.029L780.749,66.356L774.647,78.266L780.636,80.371L783.621,79.612L791.554,82.88L793.53,88.135L797.519,96.151L797.065,102.362L794.616,109.149L791.813,112.619L788.17,111.235L786.227,114.358L784.886,112.354L784.613,108.797L784.103,105.252L787.168,102.916L786.407,98.67L782.815,96.932L778.062,98.061L771.683,93.295L764.716,89.564L761.281,86.596L755.547,82.682L748.863,81.92L745.472,83.842L748.044,86.084L747.058,90.022L745.607,93.094L739.763,92.231L736.55,90.968L731.603,93.468L726.817,93.727L722.653,92.288L717.321,90.509L712.813,91.427L707.582,88.078L702.414,87.023L698.463,88.792L698.863,92.461L693.019,91.656L688.544,90.251L683.397,90.738L677.961,93.698L675.277,92.173L671.103,91.341L667.582,89.135L663.224,89.364L658.899,89.221L647.485,79.808L643.455,81.582L641.025,80.202L635.828,79.949L629.933,76.421L623.316,78.63L614.612,80.286L616.091,83.191L614.848,84.692L617.317,88.05L613.967,89.278L610.283,88.649L604.722,89.908L596.347,86.767L589.015,89.936L586.544,90.395L586.213,94.13L587.717,98.264L591.227,100.121L592.577,102.1L589.762,104.317L590.663,110.118L593.971,115.567L592.529,117.517L589.526,115.508L587.261,114.741L584.05,112.913L582.213,112.825L575.284,110.941L573.026,110.794L566.857,107.184L566.205,105.018L566.259,101.401L569.277,99.599L567.175,98.757L570.371,97.742L569.763,95.197L570.238,92.835L565.438,91.915L562.184,91.025L559.122,89.478L556.299,88.078L556.437,86.625L552.511,85.288L551.351,85.8L549.675,83.871L549.394,82.654L551.932,82.146L549.62,80.905L548.684,79.865L547.37,77.286L544.727,75.306L543.22,74.945L539.905,72.615L538.383,70.656L538.13,67.229L538.983,65.159L538.716,62.399L544.197,57.417L541.337,54.266L539.621,50.596L537.642,45.449L535.746,41.829L537.192,39.81L542.074,37.93L551.088,40.061L561.101,44.119L559.871,47.173L547.41,45.911L549.694,48.129L550.839,52.007L555.383,53.476L553.867,51.092L560.193,51.719L559.876,49.165L565.747,46.786L568.496,45.911L566.906,42.87L570.714,42.108L569.902,43.838L572.185,46.143L575.035,43.965L584.788,40.565L584.961,42.235L588.554,41.627L594.676,40.515L599.058,40.364L597.045,38.08L606.151,39.634L615.238,41.171L612.312,39.307L609.92,37.88L607.498,35.149L609.998,30.724L616.447,30.869L616.866,34.213L620.001,36.734L624.288,41.703L622.198,47.044L625.007,46.503L626.772,44.579L625.959,41.905L623.76,40.036L622.776,36.139L621.684,32.473L621.18,30.7L623.515,34.385L623.943,33.084L630.396,31.986L631.821,31.354L632.956,28.296L641.307,28.081L639.988,25.291L644.745,24.077L649.414,23.127L655.931,23.428L662.336,22.254L662.789,20.3L669.928,20.12ZM666.1,18.03L656.925,18.891L657.333,16.032L658.518,15.776L659.987,15.925L665.716,17.155ZM568.042,13.263L565.867,13.531L564.405,13.695L564.341,14.027L562.518,14.381L560.374,13.882L561.024,13.243L557.171,13.182L560.33,12.815L562.928,12.794L563.576,13.345L564.301,12.855L565.716,12.511L568.516,12.957ZM655.78,16.786L652.199,17.046L646.71,16.44L643,15.605L640.203,14.11L637.415,13.695L640.418,12.309L643.587,11.849L648.053,12.855L654.24,14.864Z"},{"n":"Rwanda","d":"M557.996,243.352L559.016,245.043L558.853,246.793L558.108,247.149L556.75,246.971L555.945,248.662L554.383,248.424L554.649,246.793L554.983,246.585L555.094,244.805L555.84,243.975L556.455,244.271Z"},{"n":"Western Sahara","d":"M458.245,159.322L458.573,157.708L458.533,158.485L450.281,162.877L447.84,170.789L447.552,176.607L437.159,177.591L437.347,176.339L443.327,175.026L445.324,169.565L450.139,162.578L451.791,160.039L454.762,160.099L456.708,159.411Z"},{"n":"Saudi Arabia","d":"M588.328,191.445L587.114,189.272L585.465,187.038L583.112,182.093L580.077,179.559L577.784,174.638L576.09,169.565L573.436,167.774L572.584,165.415L570.994,163.175L568.147,158.545L565.487,156.513L565.758,153.824L568.748,153.107L570.215,151.105L572.365,149.701L570.387,146.206L575.557,144.264L582.438,147.162L594.617,153.406L597.618,155.109L600.616,157.619L602.442,159.352L604.549,161.831L604.839,163.832L606.075,165.654L607.332,166.968L608.599,167.894L610.023,171.625L618.139,172.49L618.389,180.573L603.911,184.685L600.056,189.153L598.204,188.676L594.781,188.527L591.379,188.289L589.629,187.783L589.387,190.492Z"},{"n":"Sudan","d":"M566.717,211.929L566.37,210.384L564.701,208.186L564.568,203.848L563.208,204.323L562.323,205.334L561.248,208.75L558.732,211.186L555.592,210.087L554.042,211.513L551.425,212.107L549.214,211.394L547.611,211.661L545.797,209.107L543.281,210.889L541.807,214.096L540.839,214.274L539.736,212.493L540.1,210.057L538.279,206.938L537.353,205.334L536.73,202.451L536.073,201.529L536.37,199.061L536.634,197.455L538.351,193.439L540.033,181.825L542.904,180.573L552.722,174.608L572.394,174.608L572.868,178.068L574.549,184.715L576.999,186.532L573.985,188.736L573.067,191.624L572.508,197.188L571.274,202.659L568.778,206.403L567.387,208.453Z"},{"n":"South Sudan","d":"M566.717,211.929L566.462,215.136L564.251,216.917L567.174,218.549L568.822,220.449L568.673,225.613L565.559,228.757L561.696,229.44L559.007,229.588L556.131,226.354L553.523,226.77L551.68,226.918L549.67,223.535L547.072,220.568L544.243,217.748L542.803,215.581L541.807,214.096L543.281,210.889L545.797,209.107L547.611,211.661L549.214,211.394L551.425,212.107L554.042,211.513L555.592,210.087L558.732,211.186L561.248,208.75L562.323,205.334L563.208,204.323L564.568,203.848L564.701,208.186L566.37,210.384Z"},{"n":"Senegal","d":"M437.521,199.656L435.251,196.266L437.665,193.618L439.188,191.118L441.677,190.731L444.293,191.594L447.461,194.57L449.205,198.467L450.622,200.994L450.699,203.075L448.943,202.986L448.175,203.402L445.13,202.629L439.731,202.837L437.535,203.253L439.48,201.024L440.556,200.578L442.592,200.518L444.813,199.894L443.446,199.537L441.679,198.794L440.294,199.567Z"},{"n":"Solomon Islands","d":"M893.58,271.101L894.149,272.141L892.369,272.111L891.65,270.269L893.082,271.012ZM890.578,269.289L889.571,269.378L888.055,269.052L887.574,268.606L887.871,267.418L889.5,267.893L890.266,268.517ZM892.798,268.487L892.348,269.022L890.766,266.468L890.427,264.686L891.296,264.686L891.949,267.062ZM888.632,264.746L888.67,265.34L886.787,264.063L885.514,262.994L884.636,262.015L885.048,261.718L886.157,262.43L888.118,263.796ZM882.942,261.807L882.417,261.955L881.351,261.302L880.409,260.085L880.579,259.581L882.008,260.827Z"},{"n":"Sierra Leone","d":"M450.729,219.855L448.206,218.46L446.462,215.789L447.542,212.285L448.271,210.8L449.579,210.176L452.326,211.245L452.794,213.354L453.138,215.225L452.644,216.442L451.349,218.906Z"},{"n":"El Salvador","d":"M256.767,200.28L254.951,200.935L253.052,200.043L250.999,199.21L252.081,198.05L252.482,197.366L253.822,197.426L255.034,198.496L256.223,198.556L257.062,199.061Z"},{"n":"Somaliland","d":"M604.969,211.958L602.176,216.264L591.564,212.76L589.566,210.265L589.086,207.562L590.805,206.522L592.557,208.988L596.201,208.245L601.173,206.968L603.307,206.225L604.733,206.195L604.91,210.414Z"},{"n":"Somalia","d":"M606.721,205.631L609.206,204.323L610.264,205.126L610.212,208.424L609.108,212.701L606.525,219.826L602.31,227.482L596.799,233.919L590.616,239.14L587.195,244.301L585.1,242.551L587.258,228.372L589.576,227.393L595.15,225.167L603.884,213.77L604.91,210.414L604.733,206.195L605.569,206.077Z"},{"n":"Republic of Serbia","d":"M528.099,104.96L529.856,106.862L531.956,107.067L532.055,107.917L532.021,109.09L533.578,111.441L532.455,113.296L532.379,114.063L530.523,114.269L530.665,113.709L530.537,113.002L529.641,112.324L528.866,111.677L528.099,111.412L527.307,112.619L526.539,111.736L525.367,111.03L525.248,110.383L524.292,107.888L523.939,106.598L523.928,104.668L524.994,102.77L527.768,104.054Z"},{"n":"Suriname","d":"M333.702,222.289L337.054,222.348L341.852,222.912L340.626,227.511L341.141,230.537L340.239,233.148L337.55,232.822L336.263,233.415L336.431,234.601L333.512,231.783L332.382,230.122L331.784,226.414L333.225,224.96Z"},{"n":"Slovakia","d":"M522.475,93.122L523.516,92.921L526.032,93.324L528.703,93.209L530.4,95.053L529.616,96.527L526.377,95.833L524.882,96.874L523.542,97.134L522.53,97.8L519.78,97.829L518.263,96.093L518.684,95.082L520.453,94.851L520.895,94.447L521.505,93.64Z"},{"n":"Slovenia","d":"M511.645,101.78L514.665,101.343L517.054,100.79L517.949,101.809L516.037,103.762L515.326,104.872L513.612,104.346L511.607,104.726L511.475,103.208Z"},{"n":"Sweden","d":"M524.476,48.595L523.326,52.007L516.684,56.382L517.256,62.022L517.82,66.601L515.301,71.842L511.667,74.167L508.095,76.505L505.229,70.739L504.188,65.295L506.258,60.275L504.443,55.375L507.594,52.951L507.405,51.013L511.865,44.527L514.85,42.717L518.936,41.703L520.189,39.936L526.299,42.895L527.806,47.844ZM516.518,70.876L516.855,71.042L515.472,74.222L515.227,73.169ZM521.272,69.309L520.293,70.739L520.57,70.931L520.105,71.4L519.344,72.145L519.015,71.648L518.852,70.876L519.788,69.392L520.73,69.227ZM522.479,53.555L522.923,53.529L522.758,53.818L522.501,54.187L522.253,54.161L522.456,53.845L522.391,53.661Z"},{"n":"Swaziland","d":"M559.457,319.513L558.866,320.857L557.382,321.186L556.036,319.543L556.08,318.527L556.825,317.392L557.106,316.526L557.84,316.317L559.071,316.855L559.351,318.199Z"},{"n":"Syria","d":"M574.165,140.622L566.913,142.622L567.157,142.144L567.427,139.309L568.105,137.011L566.537,134.566L567.557,132.689L568.059,130.366L571.457,130.128L574.759,130.664L578.675,129.622L580.365,130.991L579.636,133.911Z"},{"n":"Chad","d":"M516.894,201.826L515.473,200.37L514.385,197.336L518.599,190.612L519.482,180.692L518.919,178.396L517.895,176.667L519.62,170.401L540.033,181.825L538.351,193.439L536.634,197.455L536.37,199.061L536.073,201.529L536.73,202.451L537.353,205.334L538.279,206.938L535.404,208.632L531.243,213.265L528.051,213.354L527.005,215.432L522.735,217.718L521.653,217.006L519.08,217.985L518.644,215.136L517.143,213.384L516.165,210.265L518.054,210.354L518.046,207.681L517.915,203.729Z"},{"n":"Togo","d":"M484.787,221.785L482.15,221.369L481.253,218.015L481.175,214.245L480.944,209.76L480.051,207.295L481.964,208.929L483.65,210.83L484.24,212.909Z"},{"n":"Thailand","d":"M741.214,203.818L736.626,202.51L734.525,200.191L733.687,207.8L733.406,212.582L736.31,215.373L738.464,219.648L741.431,221.547L738.973,223.12L736.555,220.301L735.062,219.677L733.087,216.531L731.448,216.887L731.012,213.384L732.537,207.473L732.426,202.005L731.846,198.942L729.094,195.105L730.501,191.951L727.313,187.813L726.708,184.655L729.119,181.318L731.711,179.321L733.387,182.033L734.981,185.311L737.816,186.204L740.13,186.651L742.428,185.817L745.287,191.177L747.891,196.295L744.802,197.188L740.253,200.251Z"},{"n":"Tajikistan","d":"M647.783,120.21L644.458,120.624L647.163,122.106L654.708,122.61L656.697,125.044L658.511,126.886L656.821,128.581L653.946,129.682L652.241,130.604L650.719,127.124L650.02,126.084L647.792,126.44L647.548,128.075L645.642,129.384L643.189,129.771L643.034,126.381L640.11,123.471L642.45,122.314L643.456,118.759L646.291,119.44Z"},{"n":"Turkmenistan","d":"M627.372,133.851L624.884,131.23L619.679,128.283L614.998,126.5L612.439,126.975L609.041,129.235L608.021,124.035L606.224,120.98L604.683,118.316L608.93,118.109L605.847,114.653L604.277,117.547L604.02,114.653L608.331,114.889L611.611,117.044L613.548,115.508L616.939,112.796L621.198,116.69L624.759,117.162L627.492,120.773L632.509,124.213L638.772,126.946L638.357,128.67L636.901,128.908L635.022,131.885L632.018,133.225L630.042,134.984Z"},{"n":"East Timor","d":"M799.266,266.379L799.632,265.696L801.889,265.013L803.66,264.924L804.51,264.538L805.449,264.924L804.434,265.726L801.659,267.032L799.436,267.864L799.468,266.973Z"},{"n":"Trinidad and Tobago","d":"M322.694,208.067L324.193,207.681L324.724,207.77L324.508,209.998L322.348,210.325L321.902,210.057L322.684,209.226Z"},{"n":"Tunisia","d":"M503.247,149.791L500.55,143.219L498.476,140.741L499.67,136.803L499.732,131.527L502.746,128.789L504.409,130.664L506.596,130.128L505.468,132.957L506.106,136.296L505.065,139.398L506.979,140.89L507.843,143.637L505.971,145.459L504.619,147.849Z"},{"n":"Turkey","d":"M566.78,116.956L572.995,117.665L577.6,116.365L582.579,117.695L583.156,120.18L586.076,121.78L585.84,126.024L587.156,129.325L585.132,129.057L581.34,129.146L577.374,129.563L572.796,130.694L568.919,130.962L568.131,132.034L566.98,133.344L566.726,130.872L563.2,130.426L558.136,132.48L553.431,130.783L551.374,132.391L546.289,130.843L542.731,126.232L542.045,122.521L548.03,119.558L553.321,117.695L558.539,114.948ZM544.116,118.878L542.308,120.476L541.424,119.085L541.416,118.493L541.924,118.138L542.477,116.306L541.273,115.508L543.573,114.594L545.628,114.977L546.029,116.128L548.172,117.074L547.826,117.813L545.039,117.961Z"},{"n":"Taiwan","d":"M783.519,167.476L783.145,172.251L782.611,174.698L780.73,172.192L779.944,169.953L780.694,167.028L782.146,164.758L783.491,165.654Z"},{"n":"United Republic of Tanzania","d":"M566.92,242.818L576.624,249.196L580.412,253.883L579.295,259.224L580.97,261.065L580.343,263.766L580.996,267.032L582.875,270.626L577.957,273.507L575.481,274.339L573.02,274.785L568.071,274.191L566.648,268.755L563.669,267.388L560.636,265.993L558.567,264.746L555.8,259.343L555.59,256.079L556.213,253.201L558.185,250.59L558.788,248.988L558.108,247.149L559.016,245.043L558.894,242.996Z"},{"n":"Uganda","d":"M561.714,243.055L557.996,243.352L555.84,243.975L556.462,240.623L557.15,236.856L559.091,234.512L558.878,233.059L560.076,228.787L563.765,228.757L567.133,227.393L568.68,230.953L568.892,236.5L566.898,239.674Z"},{"n":"Ukraine","d":"M550.512,85.686L551.802,85.147L554.747,85.005L555.975,87.194L558.107,88.221L559.168,90.022L563.814,90.595L566.736,91.886L570.414,93.669L570.567,96.787L568.2,97.945L567.3,100.063L564.148,101.227L560.213,102.479L561.844,104.989L563.864,105.867L558.508,108.063L557.479,106.101L555.163,104.668L556.481,103.033L552.515,101.197L549.793,103.179L547.168,104.843L545.038,104.755L545.873,103.441L546.156,101.984L546.889,102.158L548.823,102.042L548.479,101.314L547.107,99.337L546.239,97.887L544.171,96.989L540.92,96.382L539.473,96.816L537.332,97.771L535.462,97.51L532.563,97.163L531.413,97.018L530.4,95.053L531.471,94.476L532.543,90.796L533.759,89.65L533.416,87.052L536.25,86.226L541.08,87.137L543.746,87.593L545.174,87.765L548.114,87.907L548.631,85.857Z"},{"n":"Uruguay","d":"M338.641,329.941L342.996,331.912L346.683,333.735L350.54,337.438L350.618,340.542L347.378,344.062L344.243,343.794L340.175,342.601L338.292,339.02L338.217,335.377Z"},{"n":"United States of America","d":"M87.958,183.315L86.936,183.374L87.077,181.467L87.841,180.632L88.037,179.768L89.049,180.334L89.739,180.99L90.015,182.212ZM87.771,178.665L86.887,178.873L86.6,178.247L86.387,178.009L86.418,177.8L86.733,177.561L87.54,177.83L88.066,178.307ZM86.493,177.054L86.329,177.382L84.997,177.293L85.295,176.935ZM84.373,176.637L84.173,176.816L84.014,176.756L83.16,176.667L83.049,175.981L82.982,175.861L83.751,175.444L83.918,175.653ZM80.662,174.668L80.301,174.966L79.612,174.4L79.797,174.191L80.26,173.892L80.81,173.982ZM266.202,93.439L266.42,95.515L270.051,96.151L273.876,96.671L277.131,97.395L281.201,97.626L284.491,99.715L285.866,101.401L286.069,101.984L287.196,101.78L287.368,102.916L288.201,103.295L289.677,105.165L288.912,110.383L286.079,113.738L285.105,115.066L285.889,115.951L289.671,114.387L295.721,112.472L295.923,111.265L296.922,110.206L301.341,110.206L302.801,108.826L307.072,106.188L314.841,106.159L316.088,105.282L318.38,103.5L322.15,99.047L324.366,99.337L323.992,104.142L325.191,106.745L319.666,109.178L315.256,111.794L314.266,114.004L315.567,115.656L316.143,115.243L314.022,116.542L311.032,117.015L308.555,117.31L309.983,117.606L307.012,119.055L305.667,118.7L305.394,119.647L302.004,124.064L301.55,123.144L301.045,124.005L301.243,125.668L298.275,129.176L299.328,127.035L298.744,123.441L297.978,126.619L297.93,127.094L297.972,130.128L297.6,134.149L292.859,137.25L289.636,139.189L287.59,141.278L282.805,144.652L280.433,148.536L280.741,153.167L281.195,156.573L281.296,162.04L280.066,165.027L278.096,165.057L277.098,163.056L275.505,158.187L276.258,155.049L274.494,150.896L270.867,151.792L269.572,150.269L265.333,149.91L261.321,149.761L260.467,151.045L260.538,152.838L259.173,152.778L256.362,153.257L252.646,152.061L249.439,151.583L244.464,154.482L240.048,157.201L238.705,160.606L238.782,163.056L236.17,162.488L234.046,160.158L232.906,156.364L231.726,152.569L228.276,151.434L224.314,152.898L223.081,150.358L221.601,147.49L220.012,145.489L215.437,146.713L208.634,146.743L200.478,143.159L197.681,142.92L194.921,141.607L192.914,139.547L191.638,138.533L188.902,137.429L188.766,135.312L187.126,128.194L186.84,126.529L186.715,121.602L187.769,117.547L189.169,112.737L192.993,107.301L196.212,100.761L196.893,96.932L200.237,97.337L200.956,99.308L202.395,94.563L215.525,94.563L224.633,94.563L238.079,94.563L252.542,94.563L264.949,94.563ZM151.836,71.621L148.778,72.698L148.292,71.98L149.081,70.684L151.88,69.694L153.366,69.282L154.629,69.474L154.798,70.326ZM132.082,63.993L130.377,64.427L129.493,63.912L128.933,63.182L131.461,62.723L132.897,62.966ZM130.013,53.661L130.733,54.161L132.283,53.897L133.199,54.583L134.858,54.926L134.386,55.217L132.239,55.772L131.273,55.217L131.034,54.715L129.063,54.873L128.83,54.635ZM183.875,34.853L185.384,35.495L187.707,36.213L192.413,36.387L199.08,37.406L203.207,37.332L207.109,38.43L184.63,62.912L188.047,63.75L189.016,66.711L195.069,64.318L195.643,66.847L196.491,70.051L198.807,74.945L195.495,78.07L193.742,76.114L193.716,71.455L192.601,68.679L187.392,67.83L183.684,64.481L177.716,63.75L173.178,61.376L169.144,63.804L164.91,64.535L159.403,66.029L163.843,61.779L166.832,60.302L159.762,63.587L155.363,66.847L148.356,69.941L143.888,72.007L137.505,74.75L132.646,75.724L126.931,77.454L119.886,79.191L123.476,77.398L129.978,75.028L134.994,73.557L140.39,71.345L145.037,68.295L144.391,67.502L142.049,68.049L140.469,67.639L137.792,67.365L137.855,65.73L138.718,63.777L134.961,63.02L135.643,60.865L137.549,58.19L142.898,55.322L145.706,55.56L149.937,54.504L153.149,52.505L155.06,51.013L151.054,51.614L148.826,51.614L143.36,51.275L142.761,48.724L152.632,46.374L152.577,47.663L157.022,45.963L155.678,43.71L153.243,41.829L159.432,40.414L165.079,38.055L170.648,36.585L177.105,35.668Z"},{"n":"Uzbekistan","d":"M639.093,128.759L635.323,125.668L630.662,122.818L625.661,117.724L622.251,117.31L620.446,114.358L615.35,114.505L614.262,117.015L609.182,106.188L615.207,104.726L621.455,107.917L626.946,110.148L634.201,112.059L635.904,115.036L640,117.547L641.849,118.937L644.93,114.771L646.898,114.505L647.46,117.547L652.141,118.345L647.783,120.21L646.291,119.44L643.456,118.759L642.45,122.314L640.11,123.471L643.034,126.381L640.433,128.759Z"},{"n":"Venezuela","d":"M298.278,205.036L296.627,206.106L297.261,208.988L296.853,213.087L298.665,210.741L297.943,207.443L300.942,204.828L302.675,205.987L306.012,207.681L308.325,208.691L312.451,209.731L315.875,209.166L319.113,208.245L319.962,209.077L322.788,210.711L324.965,214.542L327.265,215.165L324.908,217.985L325.106,219.648L323.511,221.517L324.476,224.574L323.814,226.532L319.093,228.105L316.301,228.075L313.92,227.956L314.92,230.715L317.427,232.851L315.719,234.305L314.346,236.055L311.927,237.657L308.524,236.292L307.104,232.288L307.523,230.152L306.732,228.609L306.525,224.515L307.629,221.903L305.254,221.755L302.382,221.903L299.215,218.965L295.332,218.223L294.653,217.362L294.863,215.046L294.072,213.027L293.565,211.097L294.829,207.889L296.614,205.542Z"},{"n":"Vietnam","d":"M751.025,175.951L746.539,181.318L748.775,186.532L754.276,192.249L758.013,200.132L756.312,207.324L751.7,211.721L747.658,212.582L746.151,208.869L750.921,207.473L753.67,203.372L752.755,197.842L751.914,192.755L747.743,188.051L741.79,182.748L743.8,180.901L739.274,178.277L735.776,173.236L738.969,172.52L743.162,170.58L746.997,172.251L748.344,175.175Z"},{"n":"Vanuatu","d":"M904.925,288.912L904.028,289.299L903.458,287.989L903.733,287.186ZM904.049,284.329L903.955,286.74L903.353,286.353L902.783,286.531L902.602,285.698L903.008,283.437Z"},{"n":"West Bank","d":"M566.593,143.577L566.768,145.399L566.484,146.265L565.374,146.684L565.397,145.877L565.995,145.489L565.327,145.13L565.651,143.159Z"},{"n":"Yemen","d":"M614.422,190.552L612.239,192.665L609.8,194.927L603.685,198.437L601.803,198.407L598.797,200.221L596.041,200.548L594.843,201.559L593.221,202.243L590.661,202.48L589.921,199.121L588.855,196.057L588.581,194.689L588.502,192.755L589.387,190.492L589.629,187.783L591.379,188.289L594.781,188.527L598.204,188.676L600.056,189.153L603.911,184.685L613.435,188.468Z"},{"n":"South Africa","d":"M557.539,327.072L555.866,329.014L553.521,332.689L548.65,337.557L544.085,340.065L542.46,341.05L539.784,341.199L535.704,340.99L532.127,342.004L528.475,343.615L526.407,342.601L524.618,341.229L524.203,340.841L523.641,337.08L524.488,334.242L521.89,328.925L520.277,325.04L522.473,324.383L523.938,325.877L526.78,326.206L529.552,313.659L531.551,316.944L531.743,319.812L534.845,318.169L536.72,315.839L538.998,315.511L542.178,316.496L544.106,314.854L545.986,313.211L547.724,310.077L553.735,305.66L555.936,306.197L558.118,306.137L559.585,312.465L559.071,316.855L557.106,316.526L556.08,318.527L557.382,321.186L559.457,319.513L560.559,321.724L559.331,325.548ZM551.354,326.176L550.334,325.25L549.136,325.847L547.728,327.012L546.297,328.925L547.976,331.225L548.88,330.927L549.39,329.97L550.798,329.492L551.287,328.506L552.152,327.072Z"},{"n":"Zambia","d":"M563.669,267.388L565.431,271.25L564.367,274.458L563.949,277.936L564.382,281.474L556.747,286.055L553.342,287.632L552.078,288.912L548.293,293.289L546.636,293.021L543.373,292.455L542.394,291.532L538.687,292.038L535.453,287.751L541.114,278.322L541.318,276.182L541.229,273.359L541.86,272.497L543.167,273.359L545.601,274.964L549.206,274.458L551.701,276.42L553.575,279.333L555.427,276.152L552.948,275.528L552.683,272.022L552.666,267.181L554.116,264.954L558.567,264.746L560.636,265.993Z"},{"n":"Zimbabwe","d":"M558.118,306.137L555.936,306.197L553.735,305.66L550.292,303.87L549.68,300.918L545.911,297.311L544.714,295.077L546.636,293.021L548.293,293.289L552.078,288.912L553.342,287.632L556.747,286.055L558.988,287.097L560.654,288.466L563.136,289.627L562.356,295.464L562.499,298.593L561.737,300.62Z"}];
+const PUB_MAP_LOCS=[{"id":"US-Alabama","name":"Alabama, USA","px":268.9,"py":142.3,"continent":"US States"},{"id":"US-Alaska","name":"Alaska, USA","px":170.1,"py":52.9,"continent":"US States"},{"id":"US-Arizona","name":"Arizona, USA","px":209.8,"py":138,"continent":"US States"},{"id":"US-Arkansas","name":"Arkansas, USA","px":256.8,"py":136.1,"continent":"US States"},{"id":"US-California","name":"California, USA","px":193.1,"py":130.5,"continent":"US States"},{"id":"US-Colorado","name":"Colorado, USA","px":229.3,"py":123.9,"continent":"US States"},{"id":"US-Connecticut","name":"Connecticut, USA","px":309.2,"py":116.1,"continent":"US States"},{"id":"US-Delaware","name":"Delaware, USA","px":300.6,"py":124.2,"continent":"US States"},{"id":"US-Florida","name":"Florida, USA","px":278.2,"py":157.4,"continent":"US States"},{"id":"US-Georgia","name":"Georgia, USA","px":276.6,"py":144.3,"continent":"US States"},{"id":"US-Hawaii","name":"Hawaii, USA","px":85.4,"py":179.7,"continent":"US States"},{"id":"US-Idaho","name":"Idaho, USA","px":213.7,"py":108.9,"continent":"US States"},{"id":"US-Illinois","name":"Illinois, USA","px":269.3,"py":119.9,"continent":"US States"},{"id":"US-Indiana","name":"Indiana, USA","px":276.1,"py":121.4,"continent":"US States"},{"id":"US-Iowa","name":"Iowa, USA","px":260.8,"py":115,"continent":"US States"},{"id":"US-Kansas","name":"Kansas, USA","px":245.6,"py":125.3,"continent":"US States"},{"id":"US-Kentucky","name":"Kentucky, USA","px":278.7,"py":127.8,"continent":"US States"},{"id":"US-Louisiana","name":"Louisiana, USA","px":255.3,"py":147.2,"continent":"US States"},{"id":"US-Maine","name":"Maine, USA","px":319.5,"py":107.1,"continent":"US States"},{"id":"US-Maryland","name":"Maryland, USA","px":297.6,"py":123.7,"continent":"US States"},{"id":"US-Massachusetts","name":"Massachusetts, USA","px":312.5,"py":114.3,"continent":"US States"},{"id":"US-Michigan","name":"Michigan, USA","px":284.1,"py":108.2,"continent":"US States"},{"id":"US-Minnesota","name":"Minnesota, USA","px":263.4,"py":101.1,"continent":"US States"},{"id":"US-Mississippi","name":"Mississippi, USA","px":261.8,"py":142.5,"continent":"US States"},{"id":"US-Missouri","name":"Missouri, USA","px":259.9,"py":125.5,"continent":"US States"},{"id":"US-Montana","name":"Montana, USA","px":227.5,"py":100.6,"continent":"US States"},{"id":"US-Nebraska","name":"Nebraska, USA","px":245.3,"py":116.5,"continent":"US States"},{"id":"US-Nevada","name":"Nevada, USA","px":201.1,"py":125.9,"continent":"US States"},{"id":"US-New Hampshire","name":"New Hampshire, USA","px":313.4,"py":110.7,"continent":"US States"},{"id":"US-New Jersey","name":"New Jersey, USA","px":304,"py":120,"continent":"US States"},{"id":"US-New Mexico","name":"New Mexico, USA","px":223.4,"py":136.3,"continent":"US States"},{"id":"US-New York","name":"New York, USA","px":304.5,"py":114.5,"continent":"US States"},{"id":"US-North Carolina","name":"North Carolina, USA","px":288.8,"py":133.9,"continent":"US States"},{"id":"US-North Dakota","name":"North Dakota, USA","px":251.4,"py":98.8,"continent":"US States"},{"id":"US-Ohio","name":"Ohio, USA","px":284.5,"py":119.8,"continent":"US States"},{"id":"US-Oklahoma","name":"Oklahoma, USA","px":245.2,"py":134.1,"continent":"US States"},{"id":"US-Oregon","name":"Oregon, USA","px":196.3,"py":109.7,"continent":"US States"},{"id":"US-Pennsylvania","name":"Pennsylvania, USA","px":297.9,"py":119.2,"continent":"US States"},{"id":"US-Rhode Island","name":"Rhode Island, USA","px":312.1,"py":116,"continent":"US States"},{"id":"US-South Carolina","name":"South Carolina, USA","px":283.8,"py":139.2,"continent":"US States"},{"id":"US-South Dakota","name":"South Dakota, USA","px":249.5,"py":108.2,"continent":"US States"},{"id":"US-Tennessee","name":"Tennessee, USA","px":271.4,"py":133.6,"continent":"US States"},{"id":"US-Texas","name":"Texas, USA","px":237,"py":147.6,"continent":"US States"},{"id":"US-Utah","name":"Utah, USA","px":215.6,"py":120.5,"continent":"US States"},{"id":"US-Vermont","name":"Vermont, USA","px":311.3,"py":109,"continent":"US States"},{"id":"US-Virginia","name":"Virginia, USA","px":292.2,"py":127.5,"continent":"US States"},{"id":"US-Washington","name":"Washington, USA","px":203,"py":99.2,"continent":"US States"},{"id":"US-West Virginia","name":"West Virginia, USA","px":287.3,"py":125.4,"continent":"US States"},{"id":"US-Wisconsin","name":"Wisconsin, USA","px":272.2,"py":108.3,"continent":"US States"},{"id":"US-Wyoming","name":"Wyoming, USA","px":229.7,"py":112.1,"continent":"US States"},{"id":"US-DC","name":"DC, USA","px":297,"py":124.2,"continent":"US States"},{"id":"Afghanistan","name":"Afghanistan","px":640.1,"py":139,"continent":"Asia"},{"id":"Angola","name":"Angola","px":524.5,"py":276.4,"continent":"Africa"},{"id":"Albania","name":"Albania","px":527.2,"py":117.5,"continent":"Europe"},{"id":"United Arab Emirates","name":"United Arab Emirates","px":616.1,"py":168.4,"continent":"Asia"},{"id":"Argentina","name":"Argentina","px":322.7,"py":344.5,"continent":"South America"},{"id":"Armenia","name":"Armenia","px":586.3,"py":120.3,"continent":"Asia"},{"id":"Antarctica","name":"Antarctica","px":535.4,"py":459.6,"continent":"Other"},{"id":"French Southern and Antarctic Lands","name":"French Southern and Antarctic Lands","px":636.9,"py":386.3,"continent":"Antarctica"},{"id":"Australia","name":"Australia","px":814.1,"py":316,"continent":"Oceania"},{"id":"Austria","name":"Austria","px":511.8,"py":98.4,"continent":"Europe"},{"id":"Azerbaijan","name":"Azerbaijan","px":592.8,"py":120.4,"continent":"Asia"},{"id":"Burundi","name":"Burundi","px":556.7,"py":250,"continent":"Africa"},{"id":"Belgium","name":"Belgium","px":490.2,"py":89.8,"continent":"Europe"},{"id":"Benin","name":"Benin","px":485.8,"py":211.3,"continent":"Africa"},{"id":"Burkina Faso","name":"Burkina Faso","px":475.6,"py":203.6,"continent":"Africa"},{"id":"Bangladesh","name":"Bangladesh","px":705.2,"py":169.1,"continent":"Asia"},{"id":"Bulgaria","name":"Bulgaria","px":538.8,"py":112.7,"continent":"Europe"},{"id":"The Bahamas","name":"The Bahamas","px":285.9,"py":167.1,"continent":"Other"},{"id":"Bosnia and Herzegovina","name":"Bosnia and Herzegovina","px":521.3,"py":108.6,"continent":"Europe"},{"id":"Belarus","name":"Belarus","px":541.5,"py":81.9,"continent":"Europe"},{"id":"Belize","name":"Belize","px":255.8,"py":188.6,"continent":"North America"},{"id":"Bermuda","name":"Bermuda","px":322.2,"py":143.8,"continent":"Other"},{"id":"Bolivia","name":"Bolivia","px":316.4,"py":290,"continent":"South America"},{"id":"Brazil","name":"Brazil","px":344.7,"py":272.1,"continent":"South America"},{"id":"Brunei","name":"Brunei","px":774.4,"py":226.1,"continent":"Asia"},{"id":"Bhutan","name":"Bhutan","px":703.7,"py":158.4,"continent":"Asia"},{"id":"Botswana","name":"Botswana","px":540.1,"py":305.9,"continent":"Africa"},{"id":"Central African Republic","name":"Central African Republic","px":532.1,"py":220.5,"continent":"Africa"},{"id":"Canada","name":"Canada","px":263.2,"py":69.9,"continent":"North America"},{"id":"Switzerland","name":"Switzerland","px":498.6,"py":100.8,"continent":"Europe"},{"id":"Chile","name":"Chile","px":308.5,"py":349.2,"continent":"South America"},{"id":"China","name":"China","px":729.1,"py":131.1,"continent":"Asia"},{"id":"Ivory Coast","name":"Ivory Coast","px":465.6,"py":217.7,"continent":"Africa"},{"id":"Cameroon","name":"Cameroon","px":512.4,"py":222.9,"continent":"Africa"},{"id":"Democratic Republic of the Congo","name":"Democratic Republic of the Congo","px":540.3,"py":248.4,"continent":"Africa"},{"id":"Republic of the Congo","name":"Republic of the Congo","px":518.9,"py":242.5,"continent":"Africa"},{"id":"Colombia","name":"Colombia","px":292.8,"py":228.5,"continent":"South America"},{"id":"Costa Rica","name":"Costa Rica","px":265.3,"py":210.5,"continent":"North America"},{"id":"Cuba","name":"Cuba","px":282.4,"py":175.9,"continent":"North America"},{"id":"Northern Cyprus","name":"Northern Cyprus","px":560.9,"py":135,"continent":"Other"},{"id":"Cyprus","name":"Cyprus","px":559.8,"py":136.1,"continent":"Asia"},{"id":"Czech Republic","name":"Czech Republic","px":514.5,"py":92.2,"continent":"Europe"},{"id":"Germany","name":"Germany","px":503,"py":88.5,"continent":"Europe"},{"id":"Djibouti","name":"Djibouti","px":588.3,"py":205.1,"continent":"Africa"},{"id":"Denmark","name":"Denmark","px":500.2,"py":74.1,"continent":"Europe"},{"id":"Dominican Republic","name":"Dominican Republic","px":302.3,"py":183.9,"continent":"North America"},{"id":"Algeria","name":"Algeria","px":486.4,"py":156.2,"continent":"Africa"},{"id":"Ecuador","name":"Ecuador","px":278.9,"py":244.3,"continent":"South America"},{"id":"Egypt","name":"Egypt","px":554.7,"py":160.3,"continent":"Africa"},{"id":"Eritrea","name":"Eritrea","px":578,"py":194.4,"continent":"Africa"},{"id":"Spain","name":"Spain","px":471.3,"py":120.2,"continent":"Europe"},{"id":"Estonia","name":"Estonia","px":534.7,"py":67.4,"continent":"Other"},{"id":"Ethiopia","name":"Ethiopia","px":580.8,"py":214,"continent":"Africa"},{"id":"Finland","name":"Finland","px":533.3,"py":51.6,"continent":"Europe"},{"id":"Fiji","name":"Fiji","px":929.6,"py":293,"continent":"Oceania"},{"id":"Falkland Islands","name":"Falkland Islands","px":347.9,"py":393.2,"continent":"Other"},{"id":"France","name":"France","px":484.9,"py":101.3,"continent":"Europe"},{"id":"Gabon","name":"Gabon","px":510,"py":241.5,"continent":"Africa"},{"id":"United Kingdom","name":"United Kingdom","px":474.3,"py":80.7,"continent":"Europe"},{"id":"Georgia","name":"Georgia","px":581.8,"py":114.4,"continent":"Asia"},{"id":"Ghana","name":"Ghana","px":477,"py":216.7,"continent":"Africa"},{"id":"Guinea","name":"Guinea","px":451.9,"py":209,"continent":"Africa"},{"id":"Gambia","name":"Gambia","px":440.8,"py":200,"continent":"Africa"},{"id":"Guinea Bissau","name":"Guinea Bissau","px":441.5,"py":204.5,"continent":"Africa"},{"id":"Equatorial Guinea","name":"Equatorial Guinea","px":506.6,"py":235.1,"continent":"Africa"},{"id":"Greece","name":"Greece","px":533.8,"py":122.8,"continent":"Europe"},{"id":"Greenland","name":"Greenland","px":403.1,"py":26.3,"continent":"Other"},{"id":"Guatemala","name":"Guatemala","px":250.9,"py":193.3,"continent":"North America"},{"id":"French Guiana","name":"French Guiana","px":343.6,"py":228.5,"continent":"Other"},{"id":"Guyana","name":"Guyana","px":329,"py":225.8,"continent":"South America"},{"id":"Honduras","name":"Honduras","px":260.2,"py":196,"continent":"North America"},{"id":"Croatia","name":"Croatia","px":518.2,"py":106.1,"continent":"Europe"},{"id":"Haiti","name":"Haiti","px":297.3,"py":183.8,"continent":"North America"},{"id":"Hungary","name":"Hungary","px":524.1,"py":99.7,"continent":"Europe"},{"id":"Indonesia","name":"Indonesia","px":772.1,"py":241,"continent":"Asia"},{"id":"India","name":"India","px":679.1,"py":171.8,"continent":"Asia"},{"id":"Ireland","name":"Ireland","px":462.4,"py":82.6,"continent":"Europe"},{"id":"Iran","name":"Iran","px":612.1,"py":143.1,"continent":"Asia"},{"id":"Iraq","name":"Iraq","px":586.6,"py":141.2,"continent":"Asia"},{"id":"Iceland","name":"Iceland","px":442.6,"py":49.8,"continent":"Europe"},{"id":"Israel","name":"Israel","px":565.4,"py":144.3,"continent":"Asia"},{"id":"Italy","name":"Italy","px":508.4,"py":110.7,"continent":"Europe"},{"id":"Jamaica","name":"Jamaica","px":284.8,"py":186.1,"continent":"North America"},{"id":"Jordan","name":"Jordan","px":569.1,"py":147.8,"continent":"Asia"},{"id":"Japan","name":"Japan","px":809.3,"py":132.7,"continent":"Asia"},{"id":"Kazakhstan","name":"Kazakhstan","px":632.7,"py":97.3,"continent":"Asia"},{"id":"Kenya","name":"Kenya","px":577.2,"py":238,"continent":"Africa"},{"id":"Kyrgyzstan","name":"Kyrgyzstan","px":655.3,"py":116.6,"continent":"Asia"},{"id":"Cambodia","name":"Cambodia","px":746.7,"py":202.1,"continent":"Asia"},{"id":"South Korea","name":"South Korea","px":786.6,"py":131.5,"continent":"Asia"},{"id":"Kosovo","name":"Kosovo","px":528.8,"py":113.3,"continent":"Europe"},{"id":"Kuwait","name":"Kuwait","px":597.1,"py":152.8,"continent":"Asia"},{"id":"Laos","name":"Laos","px":741.4,"py":184.5,"continent":"Asia"},{"id":"Lebanon","name":"Lebanon","px":566.9,"py":139,"continent":"Asia"},{"id":"Liberia","name":"Liberia","px":456,"py":221,"continent":"Africa"},{"id":"Libya","name":"Libya","px":524.6,"py":159.8,"continent":"Africa"},{"id":"Sri Lanka","name":"Sri Lanka","px":686.3,"py":217.2,"continent":"Asia"},{"id":"Lesotho","name":"Lesotho","px":549.2,"py":328.2,"continent":"Africa"},{"id":"Lithuania","name":"Lithuania","px":532.1,"py":76.8,"continent":"Europe"},{"id":"Luxembourg","name":"Luxembourg","px":493.4,"py":92.4,"continent":"Europe"},{"id":"Latvia","name":"Latvia","px":533.4,"py":72.4,"continent":"Europe"},{"id":"Morocco","name":"Morocco","px":458.9,"py":151.5,"continent":"Africa"},{"id":"Moldova","name":"Moldova","px":544.7,"py":99.7,"continent":"Europe"},{"id":"Madagascar","name":"Madagascar","px":597.7,"py":297.3,"continent":"Africa"},{"id":"Mexico","name":"Mexico","px":223.9,"py":168.7,"continent":"North America"},{"id":"Macedonia","name":"Macedonia","px":530.9,"py":116.2,"continent":"Europe"},{"id":"Mali","name":"Mali","px":471,"py":189.2,"continent":"Africa"},{"id":"Malta","name":"Malta","px":514.7,"py":133.1,"continent":"Other"},{"id":"Myanmar","name":"Myanmar","px":722.3,"py":177.5,"continent":"Asia"},{"id":"Montenegro","name":"Montenegro","px":525,"py":112.7,"continent":"Europe"},{"id":"Mongolia","name":"Mongolia","px":715.6,"py":100.9,"continent":"Asia"},{"id":"Mozambique","name":"Mozambique","px":569.8,"py":291.2,"continent":"Africa"},{"id":"Mauritania","name":"Mauritania","px":453.9,"py":179.7,"continent":"Africa"},{"id":"Malawi","name":"Malawi","px":567,"py":279.1,"continent":"Africa"},{"id":"Malaysia","name":"Malaysia","px":773.9,"py":229.5,"continent":"Asia"},{"id":"Namibia","name":"Namibia","px":522.8,"py":305.9,"continent":"Africa"},{"id":"New Caledonia","name":"New Caledonia","px":895.5,"py":303.2,"continent":"Oceania"},{"id":"Niger","name":"Niger","px":503.5,"py":188.9,"continent":"Africa"},{"id":"Nigeria","name":"Nigeria","px":500.6,"py":211.7,"continent":"Africa"},{"id":"Nicaragua","name":"Nicaragua","px":263.6,"py":201.8,"continent":"North America"},{"id":"Netherlands","name":"Netherlands","px":492.2,"py":85.1,"continent":"Europe"},{"id":"Norway","name":"Norway","px":508.4,"py":51.6,"continent":"Europe"},{"id":"Nepal","name":"Nepal","px":687.7,"py":156.2,"continent":"Asia"},{"id":"New Zealand","name":"New Zealand","px":876.3,"py":370.7,"continent":"Oceania"},{"id":"Oman","name":"Oman","px":621.7,"py":178.2,"continent":"Asia"},{"id":"Pakistan","name":"Pakistan","px":650.5,"py":150.7,"continent":"Asia"},{"id":"Panama","name":"Panama","px":275.4,"py":214.6,"continent":"North America"},{"id":"Peru","name":"Peru","px":289.9,"py":267.3,"continent":"South America"},{"id":"Philippines","name":"Philippines","px":788,"py":193.5,"continent":"Asia"},{"id":"Papua New Guinea","name":"Papua New Guinea","px":849.1,"py":259.5,"continent":"Oceania"},{"id":"Poland","name":"Poland","px":522.9,"py":85.6,"continent":"Europe"},{"id":"Puerto Rico","name":"Puerto Rico","px":312.2,"py":185.8,"continent":"Other"},{"id":"North Korea","name":"North Korea","px":780.5,"py":120.9,"continent":"Asia"},{"id":"Portugal","name":"Portugal","px":460.8,"py":121.8,"continent":"Europe"},{"id":"Paraguay","name":"Paraguay","px":334.3,"py":309.2,"continent":"South America"},{"id":"Qatar","name":"Qatar","px":607.3,"py":164.7,"continent":"Asia"},{"id":"Romania","name":"Romania","px":537.5,"py":103.7,"continent":"Europe"},{"id":"Russia","name":"Russia","px":685.2,"py":59.3,"continent":"Europe"},{"id":"Rwanda","name":"Rwanda","px":556.7,"py":246,"continent":"Africa"},{"id":"Western Sahara","name":"Western Sahara","px":446,"py":171.4,"continent":"Other"},{"id":"Saudi Arabia","name":"Saudi Arabia","px":590.8,"py":168.1,"continent":"Asia"},{"id":"Sudan","name":"Sudan","px":555.7,"py":192.9,"continent":"Africa"},{"id":"South Sudan","name":"South Sudan","px":557.2,"py":218.3,"continent":"Africa"},{"id":"Senegal","name":"Senegal","px":443.1,"py":197.4,"continent":"Africa"},{"id":"Solomon Islands","name":"Solomon Islands","px":886.8,"py":263.4,"continent":"Oceania"},{"id":"Sierra Leone","name":"Sierra Leone","px":449.9,"py":214.8,"continent":"Africa"},{"id":"El Salvador","name":"El Salvador","px":254.2,"py":199.2,"continent":"North America"},{"id":"Somaliland","name":"Somaliland","px":598.2,"py":210.9,"continent":"Africa"},{"id":"Somalia","name":"Somalia","px":597.7,"py":225.4,"continent":"Africa"},{"id":"Republic of Serbia","name":"Republic of Serbia","px":528.3,"py":108.6,"continent":"Europe"},{"id":"Suriname","name":"Suriname","px":336.9,"py":227.7,"continent":"South America"},{"id":"Slovakia","name":"Slovakia","px":524.1,"py":95.3,"continent":"Europe"},{"id":"Slovenia","name":"Slovenia","px":514.4,"py":102.8,"continent":"Europe"},{"id":"Sweden","name":"Sweden","px":514.2,"py":56.2,"continent":"Europe"},{"id":"Swaziland","name":"Swaziland","px":557.8,"py":318.8,"continent":"Africa"},{"id":"Syria","name":"Syria","px":572.8,"py":135.3,"continent":"Asia"},{"id":"Chad","name":"Chad","px":527,"py":194.7,"continent":"Africa"},{"id":"Togo","name":"Togo","px":482.7,"py":215.3,"continent":"Africa"},{"id":"Thailand","name":"Thailand","px":736.2,"py":195.9,"continent":"Asia"},{"id":"Tajikistan","name":"Tajikistan","px":649,"py":125.1,"continent":"Asia"},{"id":"Turkmenistan","name":"Turkmenistan","px":621,"py":123.7,"continent":"Asia"},{"id":"East Timor","name":"East Timor","px":801.9,"py":266,"continent":"Asia"},{"id":"Trinidad and Tobago","name":"Trinidad and Tobago","px":323.5,"py":209,"continent":"North America"},{"id":"Tunisia","name":"Tunisia","px":503,"py":138.7,"continent":"Africa"},{"id":"Turkey","name":"Turkey","px":564.4,"py":124.1,"continent":"Asia"},{"id":"Taiwan","name":"Taiwan","px":782,"py":169.4,"continent":"Asia"},{"id":"United Republic of Tanzania","name":"United Republic of Tanzania","px":569,"py":258.6,"continent":"Africa"},{"id":"Uganda","name":"Uganda","px":562.8,"py":235.8,"continent":"Africa"},{"id":"Ukraine","name":"Ukraine","px":551.2,"py":94.6,"continent":"Europe"},{"id":"Uruguay","name":"Uruguay","px":343.8,"py":337.8,"continent":"South America"},{"id":"United States of America","name":"United States of America","px":245.1,"py":122.4,"continent":"North America"},{"id":"Uzbekistan","name":"Uzbekistan","px":628.7,"py":115.7,"continent":"Asia"},{"id":"Venezuela","name":"Venezuela","px":310.7,"py":218.8,"continent":"South America"},{"id":"Vietnam","name":"Vietnam","px":748.5,"py":188.9,"continent":"Asia"},{"id":"Vanuatu","name":"Vanuatu","px":903.4,"py":285.2,"continent":"Oceania"},{"id":"West Bank","name":"West Bank","px":566,"py":144.9,"continent":"Asia"},{"id":"Yemen","name":"Yemen","px":600,"py":193.3,"continent":"Asia"},{"id":"South Africa","name":"South Africa","px":541.6,"py":326.2,"continent":"Africa"},{"id":"Zambia","name":"Zambia","px":551.4,"py":279.8,"continent":"Africa"},{"id":"Zimbabwe","name":"Zimbabwe","px":555.2,"py":296.2,"continent":"Africa"}];
+</script>
+</body>
+</html>
